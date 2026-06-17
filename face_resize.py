@@ -8,6 +8,8 @@ import mediapipe as mp
 import numpy as np
 
 
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+
 FACE_OVAL = [
     10, 338, 297, 332, 284, 251, 389, 356,
     454, 323, 361, 288, 397, 365, 379, 378,
@@ -152,23 +154,21 @@ def optional_color_match(src_warped, target, mask):
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--source", required=True, help="source face image")
-    ap.add_argument("--target", required=True, help="target/original image")
-    ap.add_argument("--output", required=True, help="output image path")
-    ap.add_argument("--scale", type=float, default=0.92, help="face scale adjust, e.g. 0.92 smaller, 1.08 larger")
-    ap.add_argument("--offset-x", type=int, default=0)
-    ap.add_argument("--offset-y", type=int, default=0)
-    ap.add_argument("--mask-expand", type=int, default=-2)
-    ap.add_argument("--feather", type=int, default=12)
-    ap.add_argument("--no-rotate", action="store_true")
-    ap.add_argument("--color-match", action="store_true")
-    ap.add_argument("--debug-mask", default=None, help="optional mask output path")
-    args = ap.parse_args()
-
-    source = read_image(args.source)
-    target = read_image(args.target)
+def resize_face_image(
+    source_path,
+    target_path,
+    output_path,
+    scale,
+    offset_x,
+    offset_y,
+    mask_expand,
+    feather,
+    align_rotation,
+    color_match,
+    debug_mask_path=None,
+):
+    source = read_image(source_path)
+    target = read_image(target_path)
 
     src_lm = detect_landmarks_bgr(source)
     dst_lm = detect_landmarks_bgr(target)
@@ -181,10 +181,10 @@ def main():
     M = build_affine(
         src_lm,
         dst_lm,
-        scale_adjust=args.scale,
-        align_rotation=not args.no_rotate,
-        offset_x=args.offset_x,
-        offset_y=args.offset_y,
+        scale_adjust=scale,
+        align_rotation=align_rotation,
+        offset_x=offset_x,
+        offset_y=offset_y,
     )
 
     th, tw = target.shape[:2]
@@ -192,8 +192,8 @@ def main():
     src_mask = create_face_mask(
         source.shape,
         src_lm,
-        expand=args.mask_expand,
-        feather=args.feather,
+        expand=mask_expand,
+        feather=feather,
     )
 
     warped_face = cv2.warpAffine(
@@ -215,21 +215,157 @@ def main():
 
     warped_mask = np.clip(warped_mask, 0.0, 1.0)
 
-    if args.color_match:
+    if color_match:
         warped_face = optional_color_match(warped_face, target, warped_mask)
 
     alpha = warped_mask[:, :, None]
     result = warped_face.astype(np.float32) * alpha + target.astype(np.float32) * (1.0 - alpha)
     result = np.clip(result, 0, 255).astype(np.uint8)
 
-    out_path = Path(args.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(out_path), result)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(output_path), result):
+        raise RuntimeError(f"Cannot write output image: {output_path}")
 
-    if args.debug_mask:
-        cv2.imwrite(str(args.debug_mask), (warped_mask * 255).astype(np.uint8))
+    if debug_mask_path:
+        debug_mask_path = Path(debug_mask_path)
+        debug_mask_path.parent.mkdir(parents=True, exist_ok=True)
+        if not cv2.imwrite(str(debug_mask_path), (warped_mask * 255).astype(np.uint8)):
+            raise RuntimeError(f"Cannot write debug mask: {debug_mask_path}")
 
-    print("saved:", out_path)
+
+def iter_image_paths(folder, recursive=False):
+    folder = Path(folder)
+    pattern = "**/*" if recursive else "*"
+    for path in sorted(folder.glob(pattern)):
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
+            yield path
+
+
+def output_path_for(input_path, input_folder, output_folder):
+    rel_path = input_path.relative_to(input_folder)
+    return Path(output_folder) / rel_path
+
+
+def debug_mask_path_for(input_path, input_folder, debug_mask_folder):
+    rel_path = input_path.relative_to(input_folder)
+    return Path(debug_mask_folder) / rel_path.with_name(f"{rel_path.stem}_mask.png")
+
+
+def run_single(args):
+    resize_face_image(
+        source_path=args.source,
+        target_path=args.target,
+        output_path=args.output,
+        scale=args.scale,
+        offset_x=args.offset_x,
+        offset_y=args.offset_y,
+        mask_expand=args.mask_expand,
+        feather=args.feather,
+        align_rotation=not args.no_rotate,
+        color_match=args.color_match,
+        debug_mask_path=args.debug_mask,
+    )
+
+    print("saved:", Path(args.output))
+
+
+def run_batch(args):
+    input_folder = Path(args.input_folder)
+    output_folder = Path(args.output_folder)
+
+    if not input_folder.is_dir():
+        raise RuntimeError(f"Input folder does not exist or is not a directory: {input_folder}")
+
+    image_paths = list(iter_image_paths(input_folder, recursive=args.recursive))
+    if not image_paths:
+        raise RuntimeError(f"No supported images found in folder: {input_folder}")
+
+    saved = 0
+    failed = 0
+
+    for index, input_path in enumerate(image_paths, start=1):
+        output_path = output_path_for(input_path, input_folder, output_folder)
+        debug_mask_path = None
+        if args.debug_mask_folder:
+            debug_mask_path = debug_mask_path_for(input_path, input_folder, args.debug_mask_folder)
+
+        print(f"[{index}/{len(image_paths)}] processing: {input_path}")
+
+        try:
+            resize_face_image(
+                source_path=input_path,
+                target_path=input_path,
+                output_path=output_path,
+                scale=args.scale,
+                offset_x=args.offset_x,
+                offset_y=args.offset_y,
+                mask_expand=args.mask_expand,
+                feather=args.feather,
+                align_rotation=not args.no_rotate,
+                color_match=args.color_match,
+                debug_mask_path=debug_mask_path,
+            )
+        except Exception as exc:
+            failed += 1
+            print(f"failed: {input_path}: {exc}")
+            continue
+
+        saved += 1
+        print("saved:", output_path)
+
+    if failed:
+        raise RuntimeError(f"Batch finished with failures: saved {saved}, failed {failed}")
+
+    print(f"batch complete: saved {saved} image(s) to {output_folder}")
+
+
+def validate_args(ap, args):
+    batch_args = [args.input_folder, args.output_folder]
+    batch_mode = any(batch_args)
+
+    if batch_mode:
+        if not all(batch_args):
+            ap.error("--input-folder and --output-folder must be used together")
+        if args.source or args.target or args.output:
+            ap.error("Use either --input-folder/--output-folder or --source/--target/--output, not both")
+        if args.debug_mask:
+            ap.error("--debug-mask is only for single-image mode; use --debug-mask-folder for batch mode")
+        return "batch"
+
+    if not args.source or not args.target or not args.output:
+        ap.error("single-image mode requires --source, --target, and --output")
+    if args.recursive:
+        ap.error("--recursive can only be used with --input-folder")
+    if args.debug_mask_folder:
+        ap.error("--debug-mask-folder can only be used with --input-folder")
+    return "single"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--source", help="source face image")
+    ap.add_argument("--target", help="target/original image")
+    ap.add_argument("--output", help="output image path")
+    ap.add_argument("--input-folder", help="folder of images to process one by one")
+    ap.add_argument("--output-folder", help="folder to save batch results")
+    ap.add_argument("--scale", type=float, default=0.92, help="face scale adjust, e.g. 0.92 smaller, 1.08 larger")
+    ap.add_argument("--offset-x", type=int, default=0)
+    ap.add_argument("--offset-y", type=int, default=0)
+    ap.add_argument("--mask-expand", type=int, default=-2)
+    ap.add_argument("--feather", type=int, default=12)
+    ap.add_argument("--no-rotate", action="store_true")
+    ap.add_argument("--color-match", action="store_true")
+    ap.add_argument("--debug-mask", default=None, help="optional mask output path")
+    ap.add_argument("--debug-mask-folder", default=None, help="optional folder for batch debug masks")
+    ap.add_argument("--recursive", action="store_true", help="process images in nested folders")
+    args = ap.parse_args()
+
+    mode = validate_args(ap, args)
+    if mode == "batch":
+        run_batch(args)
+    else:
+        run_single(args)
 
 
 if __name__ == "__main__":

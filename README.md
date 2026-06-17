@@ -121,12 +121,37 @@ Make the face larger:
   --output output_larger.png
 ```
 
+Process every supported image in a folder:
+
+```bash
+./.venv/bin/python face_resize.py \
+  --input-folder photos \
+  --output-folder resized_photos \
+  --scale 0.92
+```
+
+Batch mode processes images one by one. Each input photo is used as both the
+source and target image, and the resized result is saved to the output folder
+with the same filename.
+
+Process nested folders too:
+
+```bash
+./.venv/bin/python face_resize.py \
+  --input-folder photos \
+  --output-folder resized_photos \
+  --recursive \
+  --scale 1.08
+```
+
 ## Parameters
 
 ```text
 --source        Source face image.
 --target        Target/original image. Preferably the same photo as source but you can play around with a new photo to achieve a superficial face swap effects, although this won't bring you the fancy deepfake result that tools like facefusion is known for.
 --output        Output image path.
+--input-folder  Folder of images to process one by one.
+--output-folder Folder to save batch results.
 --scale         Face scale multiplier. Example: 0.92 smaller, 1.08 larger.
 --offset-x      Move pasted face horizontally.
 --offset-y      Move pasted face vertically.
@@ -135,6 +160,8 @@ Make the face larger:
 --no-rotate     Disable rotation alignment.
 --color-match   Apply simple color matching.
 --debug-mask    Save the final warped mask for debugging.
+--debug-mask-folder Save final warped masks for batch debugging.
+--recursive     Process images in nested folders.
 ```
 
 ## Practical notes
