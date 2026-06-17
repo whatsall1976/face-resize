@@ -134,6 +134,18 @@ Make the face larger:
   --output output_larger.png
 ```
 
+Make the face larger and compact the surrounding boundary outward:
+
+```bash
+./.venv/bin/python face_resize.py \
+  --source original.jpg  \
+  --target original.jpg  \
+  --scale 1.08 \
+  --stretch 20 \
+  --stretch-feather 12 \
+  --output output_larger_compacted.png
+```
+
 Tune the blend differently on each side of the face:
 
 ```bash
@@ -201,10 +213,10 @@ Process nested folders too:
 --feather-curve gaussian|linear|smoothstep|power
                 Select the feather falloff curve.
 --feather-gamma Adjust the softened mask after feathering. > 1 tightens the edge, < 1 softens it.
---stretch      Stretch this many pixels from outside the original target face boundary into shrink gaps.
+--stretch      Scale-aware boundary warp width. When shrinking, stretch pixels inward into the exposed gap. When enlarging, compact pixels outward around the enlarged face edge.
 --stretch-feather
-                Blur/soften the stretched gap blend.
---stretch-gamma Adjust the stretched gap mask after feathering. > 1 tightens the edge, < 1 softens it.
+                Blur/soften the stretch or compact blend.
+--stretch-gamma Adjust the stretch or compact mask after feathering. > 1 tightens the edge, < 1 softens it.
 --stretch-mode radial
                 Stretch along rays from the detected target face center. Currently only radial is supported.
 --no-rotate     Disable rotation alignment.
@@ -227,6 +239,8 @@ tilt with the face.
 Enlarging a face is usually easier because the larger pasted face covers the original face underneath.
 
 Shrinking a face is harder because the old face boundary may still be visible around the smaller overlay. Use `--stretch` to fill that exposed ring with pixels sampled from just outside the original detected face boundary. This stretches nearby hair, ears, shadow, skin-edge, and background texture inward; it does not invent new detail.
+
+When enlarging a face with `--stretch`, the same control compacts the surrounding target pixels outward around the enlarged face boundary. This can help the edge blend follow the new larger face shape instead of leaving the original boundary texture unchanged under the feathered edge.
 
 Small to moderate shrinking usually works best. Large shrinking can make the stretched band look smeared or rubbery, so tune `--stretch`, `--stretch-feather`, and `--mask-expand` together.
 

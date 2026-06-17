@@ -435,6 +435,69 @@ def radial_stretch_gap(target, old_face_mask, new_face_mask, center, stretch, st
     return np.clip(result, 0, 255).astype(np.uint8)
 
 
+def radial_compact_expansion(target, old_face_mask, new_face_mask, center, stretch, stretch_feather, stretch_gamma):
+    stretch = int(stretch)
+    if stretch <= 0:
+        return target
+
+    h, w = target.shape[:2]
+    corners = np.array([
+        [0.0, 0.0],
+        [float(w - 1), 0.0],
+        [0.0, float(h - 1)],
+        [float(w - 1), float(h - 1)],
+    ], dtype=np.float32)
+    max_radius = float(np.max(np.linalg.norm(corners - center.astype(np.float32), axis=1)))
+    angle_bins = max(720, min(16384, int(max_radius * 4)))
+
+    old_extent = radial_mask_extent(old_face_mask, center, angle_bins)
+    new_extent = radial_mask_extent(new_face_mask, center, angle_bins)
+
+    yy, xx = np.indices((h, w), dtype=np.float32)
+    dx = xx - float(center[0])
+    dy = yy - float(center[1])
+    radii = np.hypot(dx, dy)
+    valid_radius = radii > 1e-3
+
+    angles = (np.arctan2(dy, dx) + (2.0 * math.pi)) % (2.0 * math.pi)
+    bins = np.floor(angles / (2.0 * math.pi) * angle_bins).astype(np.int32) % angle_bins
+    old_r = old_extent[bins]
+    new_r = new_extent[bins]
+
+    band = (
+        valid_radius
+        & (new_r > old_r)
+        & (radii >= new_r)
+        & (radii <= new_r + float(stretch))
+        & (new_face_mask <= 127)
+    )
+    if not np.any(band):
+        return target
+
+    map_x = xx.copy()
+    map_y = yy.copy()
+    u = np.clip((radii[band] - new_r[band]) / max(float(stretch), 1.0), 0.0, 1.0)
+    sample_r = old_r[band] + u * ((new_r[band] + float(stretch)) - old_r[band])
+    unit_x = dx[band] / radii[band]
+    unit_y = dy[band] / radii[band]
+
+    map_x[band] = float(center[0]) + unit_x * sample_r
+    map_y[band] = float(center[1]) + unit_y * sample_r
+
+    compacted = cv2.remap(
+        target,
+        map_x,
+        map_y,
+        interpolation=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REFLECT_101,
+    )
+
+    band_mask = (band.astype(np.uint8) * 255)
+    alpha = feather_alpha_mask(band_mask, stretch_feather, stretch_gamma)[:, :, None]
+    result = compacted.astype(np.float32) * alpha + target.astype(np.float32) * (1.0 - alpha)
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+
 def optional_color_match(src_warped, target, mask):
     # Simple mean/std match inside the mask. Not perfect, but helps.
     m = mask > 0.2
@@ -540,15 +603,26 @@ def resize_face_image(
         if stretch_mode != "radial":
             raise RuntimeError(f"Unsupported stretch mode: {stretch_mode}")
         face_center = dst_lm[FACE_OVAL].mean(axis=0).astype(np.float32)
-        composite_target = radial_stretch_gap(
-            target,
-            target_hard_mask,
-            warped_hard_mask,
-            face_center,
-            stretch,
-            stretch_feather,
-            stretch_gamma,
-        )
+        if scale < 1.0:
+            composite_target = radial_stretch_gap(
+                target,
+                target_hard_mask,
+                warped_hard_mask,
+                face_center,
+                stretch,
+                stretch_feather,
+                stretch_gamma,
+            )
+        elif scale > 1.0:
+            composite_target = radial_compact_expansion(
+                target,
+                target_hard_mask,
+                warped_hard_mask,
+                face_center,
+                stretch,
+                stretch_feather,
+                stretch_gamma,
+            )
 
     if color_match:
         warped_face = optional_color_match(warped_face, composite_target, warped_mask)
