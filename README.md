@@ -124,6 +124,21 @@ Make the face smaller and stretch the surrounding boundary inward:
   --output output_smaller_stretched.png
 ```
 
+Tune the stretch width differently on each side of the face:
+
+```bash
+./.venv/bin/python face_resize.py \
+  --source original.jpg  \
+  --target original.jpg  \
+  --scale 0.92 \
+  --stretch 20 \
+  --stretch-left 8 \
+  --stretch-right 28 \
+  --stretch-top 16 \
+  --stretch-bottom 4 \
+  --output output_directional_stretch.png
+```
+
 Make the face larger:
 
 ```bash
@@ -214,6 +229,11 @@ Process nested folders too:
                 Select the feather falloff curve.
 --feather-gamma Adjust the softened mask after feathering. > 1 tightens the edge, < 1 softens it.
 --stretch      Scale-aware boundary warp width. When shrinking, stretch pixels inward into the exposed gap. When enlarging, compact pixels outward around the enlarged face edge.
+--stretch-left
+--stretch-right
+--stretch-top
+--stretch-bottom
+                Override stretch or compact width for one face-local side.
 --stretch-feather
                 Blur/soften the stretch or compact blend.
 --stretch-gamma Adjust the stretch or compact mask after feathering. > 1 tightens the edge, < 1 softens it.
@@ -227,12 +247,13 @@ Process nested folders too:
 ```
 
 Directional values override only their side. If a directional value is omitted,
-the script uses the global `--mask-expand` or `--feather` value for that side.
+the script uses the global `--mask-expand`, `--feather`, or `--stretch` value
+for that side.
 
-Directional mask and feather controls are face-local, not raw image-local.
-`left` and `right` follow the eye-to-eye axis. `top` and `bottom` follow the
-perpendicular forehead-to-chin axis. If the head is tilted, these directions
-tilt with the face.
+Directional mask, feather, and stretch controls are face-local, not raw
+image-local. `left` and `right` follow the eye-to-eye axis. `top` and `bottom`
+follow the perpendicular forehead-to-chin axis. If the head is tilted, these
+directions tilt with the face.
 
 ## Practical notes
 
