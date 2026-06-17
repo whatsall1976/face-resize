@@ -29,13 +29,6 @@ Basic process:
 
 ![Face resize comparison](examples/comparsison.jpg)
 
-## Files
-
-```text
-face_resize.py
-requirements.txt
-README.md
-```
 
 ## Requirements
 
