@@ -22,8 +22,9 @@ Basic process:
 2. Detect face landmarks in the target image.
 3. Use eye distance and nose position to calculate scale, rotation, and placement.
 4. Create a soft face-oval mask.
-5. Warp the source face onto the target image.
-6. Blend the result and save a PNG/JPG output.
+5. Optionally stretch pixels from just outside the original target face boundary into the shrink gap.
+6. Warp the source face onto the target image.
+7. Blend the result and save a PNG/JPG output.
 
 ## EXAMPLE
 
@@ -111,6 +112,18 @@ Make the face smaller:
   --output output_smaller.png
 ```
 
+Make the face smaller and stretch the surrounding boundary inward:
+
+```bash
+./.venv/bin/python face_resize.py \
+  --source original.jpg  \
+  --target original.jpg  \
+  --scale 0.92 \
+  --stretch 20 \
+  --stretch-feather 12 \
+  --output output_smaller_stretched.png
+```
+
 Make the face larger:
 
 ```bash
@@ -188,6 +201,12 @@ Process nested folders too:
 --feather-curve gaussian|linear|smoothstep|power
                 Select the feather falloff curve.
 --feather-gamma Adjust the softened mask after feathering. > 1 tightens the edge, < 1 softens it.
+--stretch      Stretch this many pixels from outside the original target face boundary into shrink gaps.
+--stretch-feather
+                Blur/soften the stretched gap blend.
+--stretch-gamma Adjust the stretched gap mask after feathering. > 1 tightens the edge, < 1 softens it.
+--stretch-mode radial
+                Stretch along rays from the detected target face center. Currently only radial is supported.
 --no-rotate     Disable rotation alignment.
 --color-match   Apply simple color matching.
 --debug-mask    Save the final warped mask for debugging.
@@ -207,7 +226,9 @@ tilt with the face.
 
 Enlarging a face is usually easier because the larger pasted face covers the original face underneath.
 
-Shrinking a face is harder because the old face boundary may still be visible around the smaller overlay. For best shrinking results, use a target image where the original face area has been blurred, cleaned, or inpainted first.
+Shrinking a face is harder because the old face boundary may still be visible around the smaller overlay. Use `--stretch` to fill that exposed ring with pixels sampled from just outside the original detected face boundary. This stretches nearby hair, ears, shadow, skin-edge, and background texture inward; it does not invent new detail.
+
+Small to moderate shrinking usually works best. Large shrinking can make the stretched band look smeared or rubbery, so tune `--stretch`, `--stretch-feather`, and `--mask-expand` together.
 
 ## What this is not
 
