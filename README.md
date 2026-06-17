@@ -118,9 +118,9 @@ Make the face smaller and stretch the surrounding boundary inward:
 ./.venv/bin/python face_resize.py \
   --source original.jpg  \
   --target original.jpg  \
+  --mode stretch \
   --scale 0.92 \
-  --stretch 20 \
-  --stretch-feather 12 \
+  --stretch 1.0 \
   --output output_smaller_stretched.png
 ```
 
@@ -130,12 +130,13 @@ Tune the stretch width differently on each side of the face:
 ./.venv/bin/python face_resize.py \
   --source original.jpg  \
   --target original.jpg  \
+  --mode stretch \
   --scale 0.92 \
-  --stretch 20 \
-  --stretch-left 8 \
-  --stretch-right 28 \
-  --stretch-top 16 \
-  --stretch-bottom 4 \
+  --stretch 1.0 \
+  --stretch-left 0.5 \
+  --stretch-right 1.25 \
+  --stretch-top 1.0 \
+  --stretch-bottom 0.25 \
   --output output_directional_stretch.png
 ```
 
@@ -155,9 +156,9 @@ Make the face larger and compact the surrounding boundary outward:
 ./.venv/bin/python face_resize.py \
   --source original.jpg  \
   --target original.jpg  \
+  --mode stretch \
   --scale 1.08 \
-  --stretch 20 \
-  --stretch-feather 12 \
+  --stretch 1.0 \
   --output output_larger_compacted.png
 ```
 
@@ -210,6 +211,7 @@ Process nested folders too:
 --output        Output image path.
 --input-folder  Folder of images to process one by one.
 --output-folder Folder to save batch results.
+--mode          composite|stretch. composite uses the regular feathered paste. stretch ignores mask expansion and feathering for a pure geometry pass.
 --scale         Face scale multiplier. Example: 0.92 smaller, 1.08 larger.
 --offset-x      Move pasted face horizontally.
 --offset-y      Move pasted face vertically.
@@ -228,15 +230,15 @@ Process nested folders too:
 --feather-curve gaussian|linear|smoothstep|power
                 Select the feather falloff curve.
 --feather-gamma Adjust the softened mask after feathering. > 1 tightens the edge, < 1 softens it.
---stretch      Scale-aware boundary warp width. When shrinking, stretch pixels inward into the exposed gap. When enlarging, compact pixels outward around the enlarged face edge.
+--stretch      Scale-aware boundary warp factor. 1.0 means use an outside source band as wide as the scale-created difference. When shrinking, stretch that outside band inward into the exposed gap. When enlarging, compact a source interval outward around the enlarged face edge.
 --stretch-left
 --stretch-right
 --stretch-top
 --stretch-bottom
-                Override stretch or compact width for one face-local side.
+                Override stretch or compact factor for one face-local side.
 --stretch-feather
-                Blur/soften the stretch or compact blend.
---stretch-gamma Adjust the stretch or compact mask after feathering. > 1 tightens the edge, < 1 softens it.
+                Optional blur/soften for the stretch or compact seam in composite mode. Ignored in stretch mode.
+--stretch-gamma Adjust the stretch or compact mask after feathering in composite mode. Ignored in stretch mode.
 --stretch-mode radial
                 Stretch along rays from the detected target face center. Currently only radial is supported.
 --no-rotate     Disable rotation alignment.
@@ -259,11 +261,13 @@ directions tilt with the face.
 
 Enlarging a face is usually easier because the larger pasted face covers the original face underneath.
 
-Shrinking a face is harder because the old face boundary may still be visible around the smaller overlay. Use `--stretch` to fill that exposed ring with pixels sampled from just outside the original detected face boundary. This stretches nearby hair, ears, shadow, skin-edge, and background texture inward; it does not invent new detail.
+Shrinking a face is harder because the old face boundary may still be visible around the smaller overlay. Use `--mode stretch --stretch 1.0` to calculate the radial difference between the original face boundary and the scaled-down face boundary, sample an equally wide band outside the original boundary, and stretch that outside band inward. With `--stretch 1.0`, the outside band is stretched over the outside band plus the exposed gap, so the affected band becomes twice the difference width. This stretches nearby hair, ears, shadow, skin-edge, and background texture inward; it does not invent new detail.
 
-When enlarging a face with `--stretch`, the same control compacts the surrounding target pixels outward around the enlarged face boundary. This can help the edge blend follow the new larger face shape instead of leaving the original boundary texture unchanged under the feathered edge.
+When enlarging a face with `--mode stretch --stretch 1.0`, the same control calculates the outward difference between the original and enlarged boundaries, then compacts the corresponding surrounding target pixels outward around the enlarged face boundary.
 
-Small to moderate shrinking usually works best. Large shrinking can make the stretched band look smeared or rubbery, so tune `--stretch`, `--stretch-feather`, and `--mask-expand` together.
+In `--mode stretch`, `--mask-expand`, `--feather`, directional feather options, `--stretch-feather`, and `--stretch-gamma` are ignored. The output is a pure radial geometry pass plus a hard-mask paste of the scaled face. In `--mode composite`, those controls keep their regular blending behavior.
+
+Small to moderate shrinking usually works best. Large shrinking can make the stretched band look smeared or rubbery, so tune `--stretch` together with `--scale`.
 
 ## What this is not
 

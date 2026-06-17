@@ -102,12 +102,30 @@ def resolve_side_values(global_value, left=None, right=None, top=None, bottom=No
     return {side: int(values[side]) for side in SIDES}
 
 
+def resolve_side_float_values(global_value, left=None, right=None, top=None, bottom=None):
+    values = {
+        "left": global_value if left is None else left,
+        "right": global_value if right is None else right,
+        "top": global_value if top is None else top,
+        "bottom": global_value if bottom is None else bottom,
+    }
+    return {side: float(values[side]) for side in SIDES}
+
+
 def normalize_side_values(values, default):
     if values is None:
         return resolve_side_values(default)
     if isinstance(values, dict):
         return {side: int(values[side]) for side in SIDES}
     return resolve_side_values(values)
+
+
+def normalize_side_float_values(values, default):
+    if values is None:
+        return resolve_side_float_values(default)
+    if isinstance(values, dict):
+        return {side: float(values[side]) for side in SIDES}
+    return resolve_side_float_values(values)
 
 
 def side_values_are_symmetric(values):
@@ -369,81 +387,7 @@ def feather_alpha_mask(mask, feather, gamma):
 
 
 def radial_stretch_gap(target, old_face_mask, new_face_mask, center, landmarks, stretch, stretch_feather, stretch_gamma):
-    stretch = normalize_side_values(stretch, 0)
-    if max(stretch.values()) <= 0:
-        return target
-
-    old_binary = old_face_mask > 127
-    new_binary = new_face_mask > 127
-    gap = np.logical_and(old_binary, np.logical_not(new_binary))
-    if not np.any(gap):
-        return target
-
-    h, w = target.shape[:2]
-    corners = np.array([
-        [0.0, 0.0],
-        [float(w - 1), 0.0],
-        [0.0, float(h - 1)],
-        [float(w - 1), float(h - 1)],
-    ], dtype=np.float32)
-    max_radius = float(np.max(np.linalg.norm(corners - center.astype(np.float32), axis=1)))
-    angle_bins = max(720, min(16384, int(max_radius * 4)))
-
-    old_extent = radial_mask_extent(old_face_mask, center, angle_bins)
-    new_extent = radial_mask_extent(new_face_mask, center, angle_bins)
-    stretch_width = side_feather_widths(target.shape, landmarks, stretch)
-
-    yy, xx = np.indices((h, w), dtype=np.float32)
-    map_x = xx.copy()
-    map_y = yy.copy()
-
-    gap_y, gap_x = np.nonzero(gap)
-    dx = gap_x.astype(np.float32) - float(center[0])
-    dy = gap_y.astype(np.float32) - float(center[1])
-    radii = np.hypot(dx, dy)
-    pixel_stretch = stretch_width[gap_y, gap_x]
-    valid = (radii > 1e-3) & (pixel_stretch > 0)
-    if not np.any(valid):
-        return target
-
-    angles = (np.arctan2(dy[valid], dx[valid]) + (2.0 * math.pi)) % (2.0 * math.pi)
-    bins = np.floor(angles / (2.0 * math.pi) * angle_bins).astype(np.int32) % angle_bins
-
-    old_r = old_extent[bins]
-    new_r = new_extent[bins]
-    gap_width = np.maximum(old_r - new_r, 1.0)
-    t = np.clip((old_r - radii[valid]) / gap_width, 0.0, 1.0)
-
-    valid_stretch = pixel_stretch[valid]
-    sample_r = old_r + 0.5 + (t * np.maximum(valid_stretch - 0.5, 0.0))
-    unit_x = dx[valid] / radii[valid]
-    unit_y = dy[valid] / radii[valid]
-
-    valid_y = gap_y[valid]
-    valid_x = gap_x[valid]
-    map_x[valid_y, valid_x] = float(center[0]) + unit_x * sample_r
-    map_y[valid_y, valid_x] = float(center[1]) + unit_y * sample_r
-
-    stretched = cv2.remap(
-        target,
-        map_x,
-        map_y,
-        interpolation=cv2.INTER_CUBIC,
-        borderMode=cv2.BORDER_REFLECT_101,
-    )
-
-    active_gap = np.zeros_like(gap)
-    active_gap[valid_y, valid_x] = True
-    gap_mask = (active_gap.astype(np.uint8) * 255)
-    alpha = feather_alpha_mask(gap_mask, stretch_feather, stretch_gamma)
-    alpha[~active_gap] = 0.0
-    alpha = alpha[:, :, None]
-    result = stretched.astype(np.float32) * alpha + target.astype(np.float32) * (1.0 - alpha)
-    return np.clip(result, 0, 255).astype(np.uint8)
-
-
-def radial_compact_expansion(target, old_face_mask, new_face_mask, center, landmarks, stretch, stretch_feather, stretch_gamma):
-    stretch = normalize_side_values(stretch, 0)
+    stretch = normalize_side_float_values(stretch, 0.0)
     if max(stretch.values()) <= 0:
         return target
 
@@ -459,7 +403,7 @@ def radial_compact_expansion(target, old_face_mask, new_face_mask, center, landm
 
     old_extent = radial_mask_extent(old_face_mask, center, angle_bins)
     new_extent = radial_mask_extent(new_face_mask, center, angle_bins)
-    stretch_width = side_feather_widths(target.shape, landmarks, stretch)
+    stretch_factor = side_feather_widths(target.shape, landmarks, stretch)
 
     yy, xx = np.indices((h, w), dtype=np.float32)
     dx = xx - float(center[0])
@@ -471,13 +415,15 @@ def radial_compact_expansion(target, old_face_mask, new_face_mask, center, landm
     bins = np.floor(angles / (2.0 * math.pi) * angle_bins).astype(np.int32) % angle_bins
     old_r = old_extent[bins]
     new_r = new_extent[bins]
+    gap_width = old_r - new_r
+    source_width = gap_width * stretch_factor
 
     band = (
         valid_radius
-        & (new_r > old_r)
-        & (stretch_width > 0)
+        & (gap_width > 1e-3)
+        & (source_width > 0)
         & (radii >= new_r)
-        & (radii <= new_r + stretch_width)
+        & (radii <= old_r + source_width)
         & (new_face_mask <= 127)
     )
     if not np.any(band):
@@ -485,9 +431,79 @@ def radial_compact_expansion(target, old_face_mask, new_face_mask, center, landm
 
     map_x = xx.copy()
     map_y = yy.copy()
-    band_stretch = stretch_width[band]
-    u = np.clip((radii[band] - new_r[band]) / np.maximum(band_stretch, 1.0), 0.0, 1.0)
-    sample_r = old_r[band] + u * ((new_r[band] + band_stretch) - old_r[band])
+    destination_width = gap_width[band] + source_width[band]
+    t = np.clip((radii[band] - new_r[band]) / np.maximum(destination_width, 1e-3), 0.0, 1.0)
+    sample_r = old_r[band] + (t * source_width[band])
+    unit_x = dx[band] / radii[band]
+    unit_y = dy[band] / radii[band]
+
+    map_x[band] = float(center[0]) + unit_x * sample_r
+    map_y[band] = float(center[1]) + unit_y * sample_r
+
+    stretched = cv2.remap(
+        target,
+        map_x,
+        map_y,
+        interpolation=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REFLECT_101,
+    )
+
+    band_mask = (band.astype(np.uint8) * 255)
+    alpha = feather_alpha_mask(band_mask, stretch_feather, stretch_gamma)
+    alpha[~band] = 0.0
+    alpha = alpha[:, :, None]
+    result = stretched.astype(np.float32) * alpha + target.astype(np.float32) * (1.0 - alpha)
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+
+def radial_compact_expansion(target, old_face_mask, new_face_mask, center, landmarks, stretch, stretch_feather, stretch_gamma):
+    stretch = normalize_side_float_values(stretch, 0.0)
+    if max(stretch.values()) <= 0:
+        return target
+
+    h, w = target.shape[:2]
+    corners = np.array([
+        [0.0, 0.0],
+        [float(w - 1), 0.0],
+        [0.0, float(h - 1)],
+        [float(w - 1), float(h - 1)],
+    ], dtype=np.float32)
+    max_radius = float(np.max(np.linalg.norm(corners - center.astype(np.float32), axis=1)))
+    angle_bins = max(720, min(16384, int(max_radius * 4)))
+
+    old_extent = radial_mask_extent(old_face_mask, center, angle_bins)
+    new_extent = radial_mask_extent(new_face_mask, center, angle_bins)
+    stretch_factor = side_feather_widths(target.shape, landmarks, stretch)
+
+    yy, xx = np.indices((h, w), dtype=np.float32)
+    dx = xx - float(center[0])
+    dy = yy - float(center[1])
+    radii = np.hypot(dx, dy)
+    valid_radius = radii > 1e-3
+
+    angles = (np.arctan2(dy, dx) + (2.0 * math.pi)) % (2.0 * math.pi)
+    bins = np.floor(angles / (2.0 * math.pi) * angle_bins).astype(np.int32) % angle_bins
+    old_r = old_extent[bins]
+    new_r = new_extent[bins]
+    expansion_width = new_r - old_r
+    source_width = expansion_width * stretch_factor
+
+    band = (
+        valid_radius
+        & (new_r > old_r)
+        & (source_width > 0)
+        & (radii >= new_r)
+        & (radii <= new_r + source_width)
+        & (new_face_mask <= 127)
+    )
+    if not np.any(band):
+        return target
+
+    map_x = xx.copy()
+    map_y = yy.copy()
+    band_source_width = source_width[band]
+    u = np.clip((radii[band] - new_r[band]) / np.maximum(band_source_width, 1e-3), 0.0, 1.0)
+    sample_r = old_r[band] + u * ((new_r[band] + band_source_width) - old_r[band])
     unit_x = dx[band] / radii[band]
     unit_y = dy[band] / radii[band]
 
@@ -544,6 +560,7 @@ def resize_face_image(
     feather_gamma,
     align_rotation,
     color_match,
+    mode,
     stretch,
     stretch_feather,
     stretch_gamma,
@@ -552,7 +569,7 @@ def resize_face_image(
 ):
     source = read_image(source_path)
     target = read_image(target_path)
-    stretch = normalize_side_values(stretch, 0)
+    stretch = normalize_side_float_values(stretch, 0.0)
 
     src_lm = detect_landmarks_bgr(source)
     dst_lm = detect_landmarks_bgr(target)
@@ -573,16 +590,23 @@ def resize_face_image(
 
     th, tw = target.shape[:2]
 
-    src_mask = create_face_mask(
-        source.shape,
-        src_lm,
-        expand=mask_expand,
-        feather=feather,
-        feather_curve=feather_curve,
-        feather_gamma=feather_gamma,
-    )
-    src_hard_mask = create_face_mask_binary(source.shape, src_lm, expand=mask_expand)
+    src_hard_mask = create_face_mask_binary(source.shape, src_lm, expand=0)
     target_hard_mask = create_face_mask_binary(target.shape, dst_lm, expand=0)
+    if mode == "stretch":
+        src_mask = src_hard_mask.astype(np.float32) / 255.0
+        mask_warp_flags = cv2.INTER_NEAREST
+        stretch_feather = 0
+        stretch_gamma = 1.0
+    else:
+        src_mask = create_face_mask(
+            source.shape,
+            src_lm,
+            expand=mask_expand,
+            feather=feather,
+            feather_curve=feather_curve,
+            feather_gamma=feather_gamma,
+        )
+        mask_warp_flags = cv2.INTER_LINEAR
 
     warped_face = cv2.warpAffine(
         source,
@@ -596,7 +620,7 @@ def resize_face_image(
         src_mask,
         M,
         (tw, th),
-        flags=cv2.INTER_LINEAR,
+        flags=mask_warp_flags,
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=0,
     )
@@ -677,6 +701,10 @@ def debug_mask_path_for(input_path, input_folder, debug_mask_folder):
 
 
 def run_single(args):
+    stretch_global = args.stretch
+    if stretch_global is None:
+        stretch_global = 1.0 if args.mode == "stretch" else 0.0
+
     mask_expand = resolve_side_values(
         args.mask_expand,
         left=args.mask_expand_left,
@@ -691,8 +719,8 @@ def run_single(args):
         top=args.feather_top,
         bottom=args.feather_bottom,
     )
-    stretch = resolve_side_values(
-        args.stretch,
+    stretch = resolve_side_float_values(
+        stretch_global,
         left=args.stretch_left,
         right=args.stretch_right,
         top=args.stretch_top,
@@ -712,6 +740,7 @@ def run_single(args):
         feather_gamma=args.feather_gamma,
         align_rotation=not args.no_rotate,
         color_match=args.color_match,
+        mode=args.mode,
         stretch=stretch,
         stretch_feather=args.stretch_feather,
         stretch_gamma=args.stretch_gamma,
@@ -723,6 +752,10 @@ def run_single(args):
 
 
 def run_batch(args):
+    stretch_global = args.stretch
+    if stretch_global is None:
+        stretch_global = 1.0 if args.mode == "stretch" else 0.0
+
     input_folder = Path(args.input_folder)
     output_folder = Path(args.output_folder)
     mask_expand = resolve_side_values(
@@ -739,8 +772,8 @@ def run_batch(args):
         top=args.feather_top,
         bottom=args.feather_bottom,
     )
-    stretch = resolve_side_values(
-        args.stretch,
+    stretch = resolve_side_float_values(
+        stretch_global,
         left=args.stretch_left,
         right=args.stretch_right,
         top=args.stretch_top,
@@ -779,6 +812,7 @@ def run_batch(args):
                 feather_gamma=args.feather_gamma,
                 align_rotation=not args.no_rotate,
                 color_match=args.color_match,
+                mode=args.mode,
                 stretch=stretch,
                 stretch_feather=args.stretch_feather,
                 stretch_gamma=args.stretch_gamma,
@@ -853,6 +887,7 @@ def main():
     ap.add_argument("--output", help="output image path")
     ap.add_argument("--input-folder", help="folder of images to process one by one")
     ap.add_argument("--output-folder", help="folder to save batch results")
+    ap.add_argument("--mode", choices=("composite", "stretch"), default="composite", help="composite uses the regular feathered paste; stretch ignores feather and mask expansion for a pure geometry pass")
     ap.add_argument("--scale", type=float, default=0.92, help="face scale adjust, e.g. 0.92 smaller, 1.08 larger")
     ap.add_argument("--offset-x", type=int, default=0)
     ap.add_argument("--offset-y", type=int, default=0)
@@ -868,12 +903,12 @@ def main():
     ap.add_argument("--feather-bottom", type=int)
     ap.add_argument("--feather-curve", choices=("gaussian", "linear", "smoothstep", "power"), default="gaussian")
     ap.add_argument("--feather-gamma", type=float, default=1.0)
-    ap.add_argument("--stretch", type=int, default=0, help="scale-aware boundary warp width")
-    ap.add_argument("--stretch-left", type=int)
-    ap.add_argument("--stretch-right", type=int)
-    ap.add_argument("--stretch-top", type=int)
-    ap.add_argument("--stretch-bottom", type=int)
-    ap.add_argument("--stretch-feather", type=int, default=12, help="soften the stretched gap blend")
+    ap.add_argument("--stretch", type=float, default=None, help="scale-aware boundary warp factor; 1.0 uses a source band as wide as the scale difference")
+    ap.add_argument("--stretch-left", type=float)
+    ap.add_argument("--stretch-right", type=float)
+    ap.add_argument("--stretch-top", type=float)
+    ap.add_argument("--stretch-bottom", type=float)
+    ap.add_argument("--stretch-feather", type=int, default=0, help="optional seam softening for the stretch or compact blend")
     ap.add_argument("--stretch-gamma", type=float, default=1.0, help="adjust the stretched gap mask after feathering")
     ap.add_argument("--stretch-mode", choices=("radial",), default="radial", help="stretch mapping mode")
     ap.add_argument("--no-rotate", action="store_true")
