@@ -92,8 +92,8 @@ Example:
 ```bash
 # The same command that produced the example above
 ./.venv/bin/python face_resize.py \
-  --source source_face.png \
-  --target target_body.png \
+  --source original.jpg \
+  --target original.jpg \
   --scale 0.92 \
   --mask-expand 80 \
   --feather 120 \
@@ -105,8 +105,8 @@ Make the face smaller:
 
 ```bash
 ./.venv/bin/python face_resize.py \
-  --source source_face.png \
-  --target target_body.png \
+  --source original.jpg  \
+  --target original.jpg  \
   --scale 0.92 \
   --output output_smaller.png
 ```
@@ -115,8 +115,8 @@ Make the face larger:
 
 ```bash
 ./.venv/bin/python face_resize.py \
-  --source source_face.png \
-  --target target_body.png \
+  --source original.jpg  \
+  --target original.jpg  \
   --scale 1.08 \
   --output output_larger.png
 ```
@@ -125,7 +125,7 @@ Make the face larger:
 
 ```text
 --source        Source face image.
---target        Target/original image.
+--target        Target/original image. Preferably the same photo as source but you can play around with a new photo to achieve a superficial face swap effects, although this won't bring you the fancy deepfake result that tools like facefusion is known for.
 --output        Output image path.
 --scale         Face scale multiplier. Example: 0.92 smaller, 1.08 larger.
 --offset-x      Move pasted face horizontally.
