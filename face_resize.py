@@ -21,6 +21,9 @@ FACE_OVAL = [
 LEFT_EYE = [33, 133]
 RIGHT_EYE = [362, 263]
 NOSE_TIP = 1
+FOREHEAD = 10
+CHIN = 152
+SIDES = ("left", "right", "top", "bottom")
 
 
 def read_image(path):
@@ -71,6 +74,187 @@ def interocular_distance(landmarks):
     return float(np.linalg.norm(right - left))
 
 
+def face_axes(landmarks):
+    left = eye_center(landmarks, LEFT_EYE)
+    right = eye_center(landmarks, RIGHT_EYE)
+    x_axis = right - left
+    x_len = float(np.linalg.norm(x_axis))
+    if x_len < 1:
+        raise RuntimeError("Bad eye axis; face detection failed or face too small.")
+
+    x_axis = x_axis / x_len
+    y_axis = np.array([-x_axis[1], x_axis[0]], dtype=np.float32)
+
+    forehead_to_chin = landmarks[CHIN] - landmarks[FOREHEAD]
+    if float(np.dot(y_axis, forehead_to_chin)) < 0:
+        y_axis = -y_axis
+
+    return x_axis.astype(np.float32), y_axis.astype(np.float32)
+
+
+def resolve_side_values(global_value, left=None, right=None, top=None, bottom=None):
+    values = {
+        "left": global_value if left is None else left,
+        "right": global_value if right is None else right,
+        "top": global_value if top is None else top,
+        "bottom": global_value if bottom is None else bottom,
+    }
+    return {side: int(values[side]) for side in SIDES}
+
+
+def normalize_side_values(values, default):
+    if values is None:
+        return resolve_side_values(default)
+    if isinstance(values, dict):
+        return {side: int(values[side]) for side in SIDES}
+    return resolve_side_values(values)
+
+
+def side_values_are_symmetric(values):
+    return len({int(values[side]) for side in SIDES}) == 1
+
+
+def translate_mask(mask, vector):
+    h, w = mask.shape[:2]
+    M = np.array([
+        [1.0, 0.0, float(vector[0])],
+        [0.0, 1.0, float(vector[1])],
+    ], dtype=np.float32)
+    return cv2.warpAffine(
+        mask,
+        M,
+        (w, h),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+
+
+def expand_mask_symmetric(mask, expand):
+    if expand == 0:
+        return mask
+
+    k = abs(int(expand)) * 2 + 1
+    kernel = np.ones((k, k), np.uint8)
+    if expand > 0:
+        return cv2.dilate(mask, kernel, iterations=1)
+    return cv2.erode(mask, kernel, iterations=1)
+
+
+def expand_mask_directional(mask, landmarks, expand):
+    if side_values_are_symmetric(expand):
+        return expand_mask_symmetric(mask, expand["left"])
+
+    x_axis, y_axis = face_axes(landmarks)
+    outward = {
+        "left": -x_axis,
+        "right": x_axis,
+        "top": -y_axis,
+        "bottom": y_axis,
+    }
+
+    for side in SIDES:
+        amount = int(expand[side])
+        if amount == 0:
+            continue
+
+        direction = outward[side]
+        if amount > 0:
+            base = mask.copy()
+            expanded = mask.copy()
+            for step in range(1, amount + 1):
+                expanded = cv2.max(expanded, translate_mask(base, direction * step))
+            mask = expanded
+        else:
+            for _ in range(abs(amount)):
+                mask = cv2.bitwise_and(mask, translate_mask(mask, -direction))
+
+    return mask
+
+
+def side_feather_widths(shape, landmarks, feather):
+    h, w = shape[:2]
+    x_axis, y_axis = face_axes(landmarks)
+    center = landmarks[FACE_OVAL].mean(axis=0)
+
+    oval = landmarks[FACE_OVAL] - center
+    oval_x = oval @ x_axis
+    oval_y = oval @ y_axis
+    min_x, max_x = float(oval_x.min()), float(oval_x.max())
+    min_y, max_y = float(oval_y.min()), float(oval_y.max())
+
+    yy, xx = np.indices((h, w), dtype=np.float32)
+    rel_x = xx - center[0]
+    rel_y = yy - center[1]
+    local_x = rel_x * x_axis[0] + rel_y * x_axis[1]
+    local_y = rel_x * y_axis[0] + rel_y * y_axis[1]
+
+    distances = np.stack([
+        np.abs(local_x - min_x),
+        np.abs(local_x - max_x),
+        np.abs(local_y - min_y),
+        np.abs(local_y - max_y),
+    ])
+    side_index = np.argmin(distances, axis=0)
+    side_widths = np.array([
+        feather["left"],
+        feather["right"],
+        feather["top"],
+        feather["bottom"],
+    ], dtype=np.float32)
+    return side_widths[side_index]
+
+
+def curve_distance_feather(mask, landmarks, feather, feather_curve):
+    binary = (mask > 127).astype(np.uint8)
+    if max(feather.values()) <= 0:
+        return binary.astype(np.float32)
+
+    inside = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+    outside = cv2.distanceTransform(1 - binary, cv2.DIST_L2, 5)
+    signed_distance = inside - outside
+
+    if side_values_are_symmetric(feather):
+        width = np.full(mask.shape[:2], feather["left"], dtype=np.float32)
+    else:
+        width = side_feather_widths(mask.shape, landmarks, feather)
+
+    alpha = binary.astype(np.float32)
+    soft = width > 0
+    safe_width = np.maximum(width, 1.0)
+
+    if feather_curve == "gaussian":
+        curved = 0.5 * (1.0 + np.tanh(1.472 * signed_distance / safe_width))
+    else:
+        t = np.clip((signed_distance + safe_width) / (2.0 * safe_width), 0.0, 1.0)
+        if feather_curve == "smoothstep":
+            curved = t * t * (3.0 - 2.0 * t)
+        else:
+            curved = t
+
+    alpha[soft] = curved[soft]
+    return np.clip(alpha, 0.0, 1.0)
+
+
+def apply_feather(mask, landmarks, feather, feather_curve, feather_gamma):
+    if side_values_are_symmetric(feather) and feather_curve == "gaussian":
+        amount = int(feather["left"])
+        if amount > 0:
+            k = amount * 2 + 1
+            if k % 2 == 0:
+                k += 1
+            alpha = cv2.GaussianBlur(mask, (k, k), 0).astype(np.float32) / 255.0
+        else:
+            alpha = mask.astype(np.float32) / 255.0
+    else:
+        alpha = curve_distance_feather(mask, landmarks, feather, feather_curve)
+
+    if feather_gamma != 1.0:
+        alpha = np.power(np.clip(alpha, 0.0, 1.0), feather_gamma)
+
+    return np.clip(alpha, 0.0, 1.0)
+
+
 def build_affine(src_lm, dst_lm, scale_adjust=1.0, align_rotation=True, offset_x=0, offset_y=0):
     src_anchor = src_lm[NOSE_TIP]
     dst_anchor = dst_lm[NOSE_TIP].copy()
@@ -107,8 +291,17 @@ def build_affine(src_lm, dst_lm, scale_adjust=1.0, align_rotation=True, offset_x
     return M
 
 
-def create_face_mask(shape, landmarks, expand=0, feather=12):
+def create_face_mask(
+    shape,
+    landmarks,
+    expand=None,
+    feather=None,
+    feather_curve="gaussian",
+    feather_gamma=1.0,
+):
     h, w = shape[:2]
+    expand = normalize_side_values(expand, 0)
+    feather = normalize_side_values(feather, 12)
 
     oval = landmarks[FACE_OVAL].astype(np.int32)
     hull = cv2.convexHull(oval)
@@ -116,21 +309,8 @@ def create_face_mask(shape, landmarks, expand=0, feather=12):
     mask = np.zeros((h, w), dtype=np.uint8)
     cv2.fillConvexPoly(mask, hull, 255)
 
-    if expand != 0:
-        k = abs(int(expand)) * 2 + 1
-        kernel = np.ones((k, k), np.uint8)
-        if expand > 0:
-            mask = cv2.dilate(mask, kernel, iterations=1)
-        else:
-            mask = cv2.erode(mask, kernel, iterations=1)
-
-    if feather > 0:
-        k = int(feather) * 2 + 1
-        if k % 2 == 0:
-            k += 1
-        mask = cv2.GaussianBlur(mask, (k, k), 0)
-
-    return mask.astype(np.float32) / 255.0
+    mask = expand_mask_directional(mask, landmarks, expand)
+    return apply_feather(mask, landmarks, feather, feather_curve, feather_gamma)
 
 
 def optional_color_match(src_warped, target, mask):
@@ -163,6 +343,8 @@ def resize_face_image(
     offset_y,
     mask_expand,
     feather,
+    feather_curve,
+    feather_gamma,
     align_rotation,
     color_match,
     debug_mask_path=None,
@@ -194,6 +376,8 @@ def resize_face_image(
         src_lm,
         expand=mask_expand,
         feather=feather,
+        feather_curve=feather_curve,
+        feather_gamma=feather_gamma,
     )
 
     warped_face = cv2.warpAffine(
@@ -253,6 +437,21 @@ def debug_mask_path_for(input_path, input_folder, debug_mask_folder):
 
 
 def run_single(args):
+    mask_expand = resolve_side_values(
+        args.mask_expand,
+        left=args.mask_expand_left,
+        right=args.mask_expand_right,
+        top=args.mask_expand_top,
+        bottom=args.mask_expand_bottom,
+    )
+    feather = resolve_side_values(
+        args.feather,
+        left=args.feather_left,
+        right=args.feather_right,
+        top=args.feather_top,
+        bottom=args.feather_bottom,
+    )
+
     resize_face_image(
         source_path=args.source,
         target_path=args.target,
@@ -260,8 +459,10 @@ def run_single(args):
         scale=args.scale,
         offset_x=args.offset_x,
         offset_y=args.offset_y,
-        mask_expand=args.mask_expand,
-        feather=args.feather,
+        mask_expand=mask_expand,
+        feather=feather,
+        feather_curve=args.feather_curve,
+        feather_gamma=args.feather_gamma,
         align_rotation=not args.no_rotate,
         color_match=args.color_match,
         debug_mask_path=args.debug_mask,
@@ -273,6 +474,20 @@ def run_single(args):
 def run_batch(args):
     input_folder = Path(args.input_folder)
     output_folder = Path(args.output_folder)
+    mask_expand = resolve_side_values(
+        args.mask_expand,
+        left=args.mask_expand_left,
+        right=args.mask_expand_right,
+        top=args.mask_expand_top,
+        bottom=args.mask_expand_bottom,
+    )
+    feather = resolve_side_values(
+        args.feather,
+        left=args.feather_left,
+        right=args.feather_right,
+        top=args.feather_top,
+        bottom=args.feather_bottom,
+    )
 
     if not input_folder.is_dir():
         raise RuntimeError(f"Input folder does not exist or is not a directory: {input_folder}")
@@ -300,8 +515,10 @@ def run_batch(args):
                 scale=args.scale,
                 offset_x=args.offset_x,
                 offset_y=args.offset_y,
-                mask_expand=args.mask_expand,
-                feather=args.feather,
+                mask_expand=mask_expand,
+                feather=feather,
+                feather_curve=args.feather_curve,
+                feather_gamma=args.feather_gamma,
                 align_rotation=not args.no_rotate,
                 color_match=args.color_match,
                 debug_mask_path=debug_mask_path,
@@ -321,6 +538,18 @@ def run_batch(args):
 
 
 def validate_args(ap, args):
+    feather_values = [
+        args.feather,
+        args.feather_left,
+        args.feather_right,
+        args.feather_top,
+        args.feather_bottom,
+    ]
+    if any(value is not None and value < 0 for value in feather_values):
+        ap.error("--feather and directional feather values must be >= 0")
+    if args.feather_gamma <= 0:
+        ap.error("--feather-gamma must be > 0")
+
     batch_args = [args.input_folder, args.output_folder]
     batch_mode = any(batch_args)
 
@@ -353,7 +582,17 @@ def main():
     ap.add_argument("--offset-x", type=int, default=0)
     ap.add_argument("--offset-y", type=int, default=0)
     ap.add_argument("--mask-expand", type=int, default=-2)
+    ap.add_argument("--mask-expand-left", type=int)
+    ap.add_argument("--mask-expand-right", type=int)
+    ap.add_argument("--mask-expand-top", type=int)
+    ap.add_argument("--mask-expand-bottom", type=int)
     ap.add_argument("--feather", type=int, default=12)
+    ap.add_argument("--feather-left", type=int)
+    ap.add_argument("--feather-right", type=int)
+    ap.add_argument("--feather-top", type=int)
+    ap.add_argument("--feather-bottom", type=int)
+    ap.add_argument("--feather-curve", choices=("gaussian", "linear", "smoothstep", "power"), default="gaussian")
+    ap.add_argument("--feather-gamma", type=float, default=1.0)
     ap.add_argument("--no-rotate", action="store_true")
     ap.add_argument("--color-match", action="store_true")
     ap.add_argument("--debug-mask", default=None, help="optional mask output path")

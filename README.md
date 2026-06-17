@@ -121,6 +121,24 @@ Make the face larger:
   --output output_larger.png
 ```
 
+Tune the blend differently on each side of the face:
+
+```bash
+./.venv/bin/python face_resize.py \
+  --source original.jpg \
+  --target original.jpg \
+  --scale 0.92 \
+  --mask-expand -2 \
+  --mask-expand-top 6 \
+  --mask-expand-bottom -4 \
+  --feather 12 \
+  --feather-top 28 \
+  --feather-bottom 6 \
+  --feather-gamma 1.3 \
+  --output output_tuned.png \
+  --debug-mask output_tuned_mask.png
+```
+
 Process every supported image in a folder:
 
 ```bash
@@ -156,13 +174,34 @@ Process nested folders too:
 --offset-x      Move pasted face horizontally.
 --offset-y      Move pasted face vertically.
 --mask-expand   Expand or shrink the face mask. Negative values shrink.
---feather       Blur/soften the mask edge.
+--mask-expand-left
+--mask-expand-right
+--mask-expand-top
+--mask-expand-bottom
+                Override mask expansion for one face-local side.
+--feather       Blur/soften the mask edge. The default gaussian curve uses OpenCV GaussianBlur.
+--feather-left
+--feather-right
+--feather-top
+--feather-bottom
+                Override feather width for one face-local side.
+--feather-curve gaussian|linear|smoothstep|power
+                Select the feather falloff curve.
+--feather-gamma Adjust the softened mask after feathering. > 1 tightens the edge, < 1 softens it.
 --no-rotate     Disable rotation alignment.
 --color-match   Apply simple color matching.
 --debug-mask    Save the final warped mask for debugging.
 --debug-mask-folder Save final warped masks for batch debugging.
 --recursive     Process images in nested folders.
 ```
+
+Directional values override only their side. If a directional value is omitted,
+the script uses the global `--mask-expand` or `--feather` value for that side.
+
+Directional mask and feather controls are face-local, not raw image-local.
+`left` and `right` follow the eye-to-eye axis. `top` and `bottom` follow the
+perpendicular forehead-to-chin axis. If the head is tilted, these directions
+tilt with the face.
 
 ## Practical notes
 
