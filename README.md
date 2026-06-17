@@ -25,6 +25,10 @@ Basic process:
 5. Warp the source face onto the target image.
 6. Blend the result and save a PNG/JPG output.
 
+## EXAMPLE
+
+![Face resize comparison](examples/comparsison.jpg)
+
 ## Files
 
 ```text
@@ -93,12 +97,13 @@ has mp.solutions: True
 Example:
 
 ```bash
+# The same command that produced the example above
 ./.venv/bin/python face_resize.py \
   --source source_face.png \
   --target target_body.png \
   --scale 0.92 \
-  --mask-expand 50 \
-  --feather 15 \
+  --mask-expand 80 \
+  --feather 120 \
   --output output_face_scaled.png \
   --debug-mask output_mask.png
 ```
