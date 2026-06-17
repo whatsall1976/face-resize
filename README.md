@@ -239,8 +239,8 @@ Process nested folders too:
 --stretch-feather
                 Optional blur/soften for the stretch or compact seam in composite mode. Ignored in stretch mode.
 --stretch-gamma Adjust the stretch or compact mask after feathering in composite mode. Ignored in stretch mode.
---stretch-mode radial
-                Stretch along rays from the detected target face center. Currently only radial is supported.
+--stretch-mode box|radial
+                Select the stretch mapping. box is the default and uses a face-local box aligned to the eye-to-eye axis and forehead-to-chin direction. radial is the older center-ray mapping.
 --no-rotate     Disable rotation alignment.
 --color-match   Apply simple color matching.
 --debug-mask    Save the final warped mask for debugging.
@@ -255,17 +255,18 @@ for that side.
 Directional mask, feather, and stretch controls are face-local, not raw
 image-local. `left` and `right` follow the eye-to-eye axis. `top` and `bottom`
 follow the perpendicular forehead-to-chin axis. If the head is tilted, these
-directions tilt with the face.
+directions tilt with the face. The default `--stretch-mode box` uses this same
+face-local axis system, not the raw image horizontal and vertical axes.
 
 ## Practical notes
 
 Enlarging a face is usually easier because the larger pasted face covers the original face underneath.
 
-Shrinking a face is harder because the old face boundary may still be visible around the smaller overlay. Use `--mode stretch --stretch 1.0` to calculate the radial difference between the original face boundary and the scaled-down face boundary, sample an equally wide band outside the original boundary, and stretch that outside band inward. With `--stretch 1.0`, the outside band is stretched over the outside band plus the exposed gap, so the affected band becomes twice the difference width. This stretches nearby hair, ears, shadow, skin-edge, and background texture inward; it does not invent new detail.
+Shrinking a face is harder because the old face boundary may still be visible around the smaller overlay. Use `--mode stretch --stretch 1.0` to calculate the face-local box difference between the original face boundary and the scaled-down face boundary, sample an equally wide band outside the original boundary, and stretch that outside band inward. With `--stretch 1.0`, the outside band is stretched over the outside band plus the exposed gap, so the affected band becomes twice the difference width. This stretches nearby hair, ears, shadow, skin-edge, and background texture inward; it does not invent new detail.
 
 When enlarging a face with `--mode stretch --stretch 1.0`, the same control calculates the outward difference between the original and enlarged boundaries, then compacts the corresponding surrounding target pixels outward around the enlarged face boundary.
 
-In `--mode stretch`, `--mask-expand`, `--feather`, directional feather options, `--stretch-feather`, and `--stretch-gamma` are ignored. The output is a pure radial geometry pass plus a hard-mask paste of the scaled face. In `--mode composite`, those controls keep their regular blending behavior.
+In `--mode stretch`, `--mask-expand`, `--feather`, directional feather options, `--stretch-feather`, and `--stretch-gamma` are ignored. The output is a pure geometry pass plus a hard-mask paste of the scaled face. In the default `--stretch-mode box`, that geometry is aligned to the face-local axes. In `--mode composite`, those controls keep their regular blending behavior.
 
 Small to moderate shrinking usually works best. Large shrinking can make the stretched band look smeared or rubbery, so tune `--stretch` together with `--scale`.
 

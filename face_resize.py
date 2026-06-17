@@ -526,6 +526,221 @@ def radial_compact_expansion(target, old_face_mask, new_face_mask, center, landm
     return np.clip(result, 0, 255).astype(np.uint8)
 
 
+def face_local_mask_bbox(mask, center, x_axis, y_axis):
+    ys, xs = np.nonzero(mask > 127)
+    if len(xs) == 0:
+        return None
+    dx = xs.astype(np.float32) - float(center[0])
+    dy = ys.astype(np.float32) - float(center[1])
+    local_x = dx * x_axis[0] + dy * x_axis[1]
+    local_y = dx * y_axis[0] + dy * y_axis[1]
+    return np.array([
+        float(local_x.min()),
+        float(local_y.min()),
+        float(local_x.max()),
+        float(local_y.max()),
+    ], dtype=np.float32)
+
+
+def blend_warped_region(target, warped, active, feather, gamma):
+    active_mask = (active.astype(np.uint8) * 255)
+    alpha = feather_alpha_mask(active_mask, feather, gamma)
+    alpha[~active] = 0.0
+    alpha = alpha[:, :, None]
+    result = warped.astype(np.float32) * alpha + target.astype(np.float32) * (1.0 - alpha)
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+
+def box_stretch_shrink(target, old_face_mask, new_face_mask, landmarks, stretch, stretch_feather, stretch_gamma):
+    stretch = normalize_side_float_values(stretch, 0.0)
+    if max(stretch.values()) <= 0:
+        return target
+
+    center = landmarks[FACE_OVAL].mean(axis=0).astype(np.float32)
+    x_axis, y_axis = face_axes(landmarks)
+    old_box = face_local_mask_bbox(old_face_mask, center, x_axis, y_axis)
+    new_box = face_local_mask_bbox(new_face_mask, center, x_axis, y_axis)
+    if old_box is None or new_box is None:
+        return target
+
+    old_left, old_top, old_right, old_bottom = old_box
+    new_left, new_top, new_right, new_bottom = new_box
+
+    gap_left = max(new_left - old_left, 0.0)
+    gap_right = max(old_right - new_right, 0.0)
+    gap_top = max(new_top - old_top, 0.0)
+    gap_bottom = max(old_bottom - new_bottom, 0.0)
+
+    source_left = gap_left * stretch["left"]
+    source_right = gap_right * stretch["right"]
+    source_top = gap_top * stretch["top"]
+    source_bottom = gap_bottom * stretch["bottom"]
+
+    if max(source_left, source_right, source_top, source_bottom) <= 0:
+        return target
+
+    h, w = target.shape[:2]
+    yy, xx = np.indices((h, w), dtype=np.float32)
+    dx = xx - float(center[0])
+    dy = yy - float(center[1])
+    local_x = dx * x_axis[0] + dy * x_axis[1]
+    local_y = dx * y_axis[0] + dy * y_axis[1]
+    sample_local_x = local_x.copy()
+    sample_local_y = local_y.copy()
+
+    outer_left = old_left - source_left
+    outer_right = old_right + source_right
+    outer_top = old_top - source_top
+    outer_bottom = old_bottom + source_bottom
+
+    active = (
+        (local_x >= outer_left)
+        & (local_x <= outer_right)
+        & (local_y >= outer_top)
+        & (local_y <= outer_bottom)
+        & (new_face_mask <= 127)
+    )
+
+    if source_left > 0 and gap_left > 0:
+        dst0 = outer_left
+        dst1 = new_left
+        src0 = outer_left
+        src1 = old_left
+        region = active & (local_x >= dst0) & (local_x <= dst1)
+        sample_local_x[region] = src0 + (local_x[region] - dst0) * ((src1 - src0) / max(dst1 - dst0, 1e-3))
+
+    if source_right > 0 and gap_right > 0:
+        dst0 = new_right
+        dst1 = outer_right
+        src0 = old_right
+        src1 = outer_right
+        region = active & (local_x >= dst0) & (local_x <= dst1)
+        sample_local_x[region] = src0 + (local_x[region] - dst0) * ((src1 - src0) / max(dst1 - dst0, 1e-3))
+
+    if source_top > 0 and gap_top > 0:
+        dst0 = outer_top
+        dst1 = new_top
+        src0 = outer_top
+        src1 = old_top
+        region = active & (local_y >= dst0) & (local_y <= dst1)
+        sample_local_y[region] = src0 + (local_y[region] - dst0) * ((src1 - src0) / max(dst1 - dst0, 1e-3))
+
+    if source_bottom > 0 and gap_bottom > 0:
+        dst0 = new_bottom
+        dst1 = outer_bottom
+        src0 = old_bottom
+        src1 = outer_bottom
+        region = active & (local_y >= dst0) & (local_y <= dst1)
+        sample_local_y[region] = src0 + (local_y[region] - dst0) * ((src1 - src0) / max(dst1 - dst0, 1e-3))
+
+    map_x = float(center[0]) + sample_local_x * x_axis[0] + sample_local_y * y_axis[0]
+    map_y = float(center[1]) + sample_local_x * x_axis[1] + sample_local_y * y_axis[1]
+
+    warped = cv2.remap(
+        target,
+        map_x,
+        map_y,
+        interpolation=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REFLECT_101,
+    )
+    return blend_warped_region(target, warped, active, stretch_feather, stretch_gamma)
+
+
+def box_compact_expansion(target, old_face_mask, new_face_mask, landmarks, stretch, stretch_feather, stretch_gamma):
+    stretch = normalize_side_float_values(stretch, 0.0)
+    if max(stretch.values()) <= 0:
+        return target
+
+    center = landmarks[FACE_OVAL].mean(axis=0).astype(np.float32)
+    x_axis, y_axis = face_axes(landmarks)
+    old_box = face_local_mask_bbox(old_face_mask, center, x_axis, y_axis)
+    new_box = face_local_mask_bbox(new_face_mask, center, x_axis, y_axis)
+    if old_box is None or new_box is None:
+        return target
+
+    old_left, old_top, old_right, old_bottom = old_box
+    new_left, new_top, new_right, new_bottom = new_box
+
+    gap_left = max(old_left - new_left, 0.0)
+    gap_right = max(new_right - old_right, 0.0)
+    gap_top = max(old_top - new_top, 0.0)
+    gap_bottom = max(new_bottom - old_bottom, 0.0)
+
+    dest_left = gap_left * stretch["left"]
+    dest_right = gap_right * stretch["right"]
+    dest_top = gap_top * stretch["top"]
+    dest_bottom = gap_bottom * stretch["bottom"]
+
+    if max(dest_left, dest_right, dest_top, dest_bottom) <= 0:
+        return target
+
+    h, w = target.shape[:2]
+    yy, xx = np.indices((h, w), dtype=np.float32)
+    dx = xx - float(center[0])
+    dy = yy - float(center[1])
+    local_x = dx * x_axis[0] + dy * x_axis[1]
+    local_y = dx * y_axis[0] + dy * y_axis[1]
+    sample_local_x = local_x.copy()
+    sample_local_y = local_y.copy()
+
+    outer_left = new_left - dest_left
+    outer_right = new_right + dest_right
+    outer_top = new_top - dest_top
+    outer_bottom = new_bottom + dest_bottom
+
+    active = (
+        (local_x >= outer_left)
+        & (local_x <= outer_right)
+        & (local_y >= outer_top)
+        & (local_y <= outer_bottom)
+        & (new_face_mask <= 127)
+    )
+
+    if dest_left > 0 and gap_left > 0:
+        dst0 = outer_left
+        dst1 = new_left
+        src0 = new_left
+        src1 = old_left
+        region = active & (local_x >= dst0) & (local_x <= dst1)
+        sample_local_x[region] = src0 + (local_x[region] - dst0) * ((src1 - src0) / max(dst1 - dst0, 1e-3))
+
+    if dest_right > 0 and gap_right > 0:
+        dst0 = new_right
+        dst1 = outer_right
+        src0 = old_right
+        src1 = new_right
+        region = active & (local_x >= dst0) & (local_x <= dst1)
+        sample_local_x[region] = src0 + (local_x[region] - dst0) * ((src1 - src0) / max(dst1 - dst0, 1e-3))
+
+    if dest_top > 0 and gap_top > 0:
+        dst0 = outer_top
+        dst1 = new_top
+        src0 = new_top
+        src1 = old_top
+        region = active & (local_y >= dst0) & (local_y <= dst1)
+        sample_local_y[region] = src0 + (local_y[region] - dst0) * ((src1 - src0) / max(dst1 - dst0, 1e-3))
+
+    if dest_bottom > 0 and gap_bottom > 0:
+        dst0 = new_bottom
+        dst1 = outer_bottom
+        src0 = old_bottom
+        src1 = new_bottom
+        region = active & (local_y >= dst0) & (local_y <= dst1)
+        sample_local_y[region] = src0 + (local_y[region] - dst0) * ((src1 - src0) / max(dst1 - dst0, 1e-3))
+
+    map_x = float(center[0]) + sample_local_x * x_axis[0] + sample_local_y * y_axis[0]
+    map_y = float(center[1]) + sample_local_x * x_axis[1] + sample_local_y * y_axis[1]
+
+    warped = cv2.remap(
+        target,
+        map_x,
+        map_y,
+        interpolation=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REFLECT_101,
+    )
+    return blend_warped_region(target, warped, active, stretch_feather, stretch_gamma)
+
+
 def optional_color_match(src_warped, target, mask):
     # Simple mean/std match inside the mask. Not perfect, but helps.
     m = mask > 0.2
@@ -637,31 +852,53 @@ def resize_face_image(
 
     composite_target = target
     if max(stretch.values()) > 0:
-        if stretch_mode != "radial":
+        if stretch_mode not in ("box", "radial"):
             raise RuntimeError(f"Unsupported stretch mode: {stretch_mode}")
         face_center = dst_lm[FACE_OVAL].mean(axis=0).astype(np.float32)
         if scale < 1.0:
-            composite_target = radial_stretch_gap(
-                target,
-                target_hard_mask,
-                warped_hard_mask,
-                face_center,
-                dst_lm,
-                stretch,
-                stretch_feather,
-                stretch_gamma,
-            )
+            if stretch_mode == "box":
+                composite_target = box_stretch_shrink(
+                    target,
+                    target_hard_mask,
+                    warped_hard_mask,
+                    dst_lm,
+                    stretch,
+                    stretch_feather,
+                    stretch_gamma,
+                )
+            else:
+                composite_target = radial_stretch_gap(
+                    target,
+                    target_hard_mask,
+                    warped_hard_mask,
+                    face_center,
+                    dst_lm,
+                    stretch,
+                    stretch_feather,
+                    stretch_gamma,
+                )
         elif scale > 1.0:
-            composite_target = radial_compact_expansion(
-                target,
-                target_hard_mask,
-                warped_hard_mask,
-                face_center,
-                dst_lm,
-                stretch,
-                stretch_feather,
-                stretch_gamma,
-            )
+            if stretch_mode == "box":
+                composite_target = box_compact_expansion(
+                    target,
+                    target_hard_mask,
+                    warped_hard_mask,
+                    dst_lm,
+                    stretch,
+                    stretch_feather,
+                    stretch_gamma,
+                )
+            else:
+                composite_target = radial_compact_expansion(
+                    target,
+                    target_hard_mask,
+                    warped_hard_mask,
+                    face_center,
+                    dst_lm,
+                    stretch,
+                    stretch_feather,
+                    stretch_gamma,
+                )
 
     if color_match:
         warped_face = optional_color_match(warped_face, composite_target, warped_mask)
@@ -910,7 +1147,7 @@ def main():
     ap.add_argument("--stretch-bottom", type=float)
     ap.add_argument("--stretch-feather", type=int, default=0, help="optional seam softening for the stretch or compact blend")
     ap.add_argument("--stretch-gamma", type=float, default=1.0, help="adjust the stretched gap mask after feathering")
-    ap.add_argument("--stretch-mode", choices=("radial",), default="radial", help="stretch mapping mode")
+    ap.add_argument("--stretch-mode", choices=("box", "radial"), default="box", help="stretch mapping mode")
     ap.add_argument("--no-rotate", action="store_true")
     ap.add_argument("--color-match", action="store_true")
     ap.add_argument("--debug-mask", default=None, help="optional mask output path")
