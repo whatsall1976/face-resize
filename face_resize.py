@@ -7,6 +7,8 @@ import mediapipe as mp
 import numpy as np
 
 
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+
 FACE_OVAL = [
     10, 338, 297, 332, 284, 251, 389, 356,
     454, 323, 361, 288, 397, 365, 379, 378,
@@ -383,34 +385,57 @@ def resize_face_local(input_path, output_path, scale_x, scale_y, anchor_scale, f
         write_image(debug_mesh, draw_debug_mesh(img, src_points, dst_points, point_kinds, triangles))
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Resize a detected face with a continuous face-local landmark mesh warp."
-    )
-    parser.add_argument("--input", required=True, help="Input image path.")
-    parser.add_argument("--output", required=True, help="Output image path.")
-    parser.add_argument("--scale", type=float, default=1.0, help="Uniform face-local scale.")
-    parser.add_argument("--scale-x", type=float, default=None, help="Face-local horizontal scale.")
-    parser.add_argument("--scale-y", type=float, default=None, help="Face-local vertical scale.")
-    parser.add_argument("--anchor-scale", type=float, default=1.6, help="Expansion factor for fixed outer anchors.")
-    parser.add_argument("--forehead-expand", type=float, default=0.0, help="Add moving forehead controls above the face oval as a fraction of face height.")
-    parser.add_argument("--debug-points", default=None, help="Optional image showing source, destination, and anchor points.")
-    parser.add_argument("--debug-mesh", default=None, help="Optional image showing destination Delaunay mesh.")
-    return parser.parse_args()
+def iter_image_paths(folder, recursive=False):
+    folder = Path(folder)
+    pattern = "**/*" if recursive else "*"
+    for path in sorted(folder.glob(pattern)):
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
+            yield path
 
 
-def main():
-    args = parse_args()
+def output_path_for(input_path, input_folder, output_folder):
+    rel_path = input_path.relative_to(input_folder)
+    return Path(output_folder) / rel_path
+
+
+def validate_common_args(parser, args):
     scale_x = args.scale if args.scale_x is None else args.scale_x
     scale_y = args.scale if args.scale_y is None else args.scale_y
 
     if scale_x <= 0 or scale_y <= 0:
-        raise RuntimeError("Scale values must be greater than zero.")
+        parser.error("scale values must be greater than zero")
     if args.anchor_scale <= 1.0:
-        raise RuntimeError("--anchor-scale must be greater than 1.0.")
+        parser.error("--anchor-scale must be greater than 1.0")
     if args.forehead_expand < 0:
-        raise RuntimeError("--forehead-expand must be greater than or equal to 0.")
+        parser.error("--forehead-expand must be greater than or equal to 0")
 
+    return scale_x, scale_y
+
+
+def validate_args(parser, args):
+    scale_x, scale_y = validate_common_args(parser, args)
+
+    batch_args = [args.input_folder, args.output_folder]
+    batch_mode = any(batch_args)
+
+    if batch_mode:
+        if not all(batch_args):
+            parser.error("--input-folder and --output-folder must be used together")
+        if args.input or args.output:
+            parser.error("Use either --input-folder/--output-folder or --input/--output, not both")
+        if args.debug_points or args.debug_mesh:
+            parser.error("--debug-points and --debug-mesh are only for single-image mode")
+        return "batch", scale_x, scale_y
+
+    if not args.input or not args.output:
+        parser.error("single-image mode requires --input and --output")
+    if args.recursive:
+        parser.error("--recursive can only be used with --input-folder")
+
+    return "single", scale_x, scale_y
+
+
+def run_single(args, scale_x, scale_y):
     resize_face_local(
         input_path=args.input,
         output_path=args.output,
@@ -422,6 +447,76 @@ def main():
         debug_mesh=args.debug_mesh,
     )
     print("saved:", Path(args.output))
+
+
+def run_batch(args, scale_x, scale_y):
+    input_folder = Path(args.input_folder)
+    output_folder = Path(args.output_folder)
+
+    if not input_folder.is_dir():
+        raise RuntimeError(f"Input folder does not exist or is not a directory: {input_folder}")
+
+    image_paths = list(iter_image_paths(input_folder, recursive=args.recursive))
+    if not image_paths:
+        raise RuntimeError(f"No supported images found in folder: {input_folder}")
+
+    saved = 0
+    failed = 0
+
+    for index, input_path in enumerate(image_paths, start=1):
+        output_path = output_path_for(input_path, input_folder, output_folder)
+        print(f"[{index}/{len(image_paths)}] processing: {input_path}")
+
+        try:
+            resize_face_local(
+                input_path=input_path,
+                output_path=output_path,
+                scale_x=scale_x,
+                scale_y=scale_y,
+                anchor_scale=args.anchor_scale,
+                forehead_expand=args.forehead_expand,
+            )
+        except Exception as exc:
+            failed += 1
+            print(f"failed: {input_path}: {exc}")
+            continue
+
+        saved += 1
+        print("saved:", output_path)
+
+    if failed:
+        raise RuntimeError(f"Batch finished with failures: saved {saved}, failed {failed}")
+
+    print(f"batch complete: saved {saved} image(s) to {output_folder}")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Resize a detected face with a continuous face-local landmark mesh warp."
+    )
+    parser.add_argument("--input", help="Input image path.")
+    parser.add_argument("--output", help="Output image path.")
+    parser.add_argument("--input-folder", help="Folder of images to process one by one.")
+    parser.add_argument("--output-folder", help="Folder to save batch results.")
+    parser.add_argument("--scale", type=float, default=1.0, help="Uniform face-local scale.")
+    parser.add_argument("--scale-x", type=float, default=None, help="Face-local horizontal scale.")
+    parser.add_argument("--scale-y", type=float, default=None, help="Face-local vertical scale.")
+    parser.add_argument("--anchor-scale", type=float, default=1.6, help="Expansion factor for fixed outer anchors.")
+    parser.add_argument("--forehead-expand", type=float, default=0.0, help="Add moving forehead controls above the face oval as a fraction of face height.")
+    parser.add_argument("--debug-points", default=None, help="Optional image showing source, destination, and anchor points.")
+    parser.add_argument("--debug-mesh", default=None, help="Optional image showing destination Delaunay mesh.")
+    parser.add_argument("--recursive", action="store_true", help="Process images in nested folders.")
+    args = parser.parse_args()
+    mode, scale_x, scale_y = validate_args(parser, args)
+    return args, mode, scale_x, scale_y
+
+
+def main():
+    args, mode, scale_x, scale_y = parse_args()
+    if mode == "batch":
+        run_batch(args, scale_x, scale_y)
+    else:
+        run_single(args, scale_x, scale_y)
 
 
 if __name__ == "__main__":

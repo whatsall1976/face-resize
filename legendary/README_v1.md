@@ -27,6 +27,10 @@ Basic process:
 5. Warp the source face onto the target image.
 6. Blend the result and save a PNG/JPG output.
 
+## Example
+
+![Face resize comparison](examples/comparsison_v1.jpg)
+
 ## Requirements
 
 Use Python 3.12.

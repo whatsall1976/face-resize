@@ -32,6 +32,11 @@ The deformation is one continuous field. There is no separate face patch paste,
 source/target swap, mask expansion, inpainting, or semantic hair detection in
 this version.
 
+## Example
+
+![Face resize comparison](examples/comparsison.jpg)
+
+
 ## Requirements
 
 Use Python 3.12.
@@ -123,6 +128,25 @@ Write debug point and mesh overlays:
   --debug-mesh debug_mesh.png
 ```
 
+Batch process a folder:
+
+```bash
+./.venv/bin/python face_resize.py \
+  --input-folder photos \
+  --output-folder resized_photos \
+  --scale 0.92
+```
+
+Batch process nested folders:
+
+```bash
+./.venv/bin/python face_resize.py \
+  --input-folder photos \
+  --output-folder resized_photos \
+  --recursive \
+  --scale 0.92
+```
+
 Include more forehead in the moving control area:
 
 ```bash
@@ -147,6 +171,8 @@ Try a few shrink strengths:
 ```text
 --input         Input image path.
 --output        Output image path.
+--input-folder  Folder of images to process one by one.
+--output-folder Folder to save batch results.
 --scale         Uniform face-local scale. Example: 0.92 smaller, 1.08 larger.
 --scale-x       Face-local horizontal scale. Overrides --scale for the eye-to-eye axis.
 --scale-y       Face-local vertical scale. Overrides --scale for the forehead-to-chin axis.
@@ -155,7 +181,13 @@ Try a few shrink strengths:
                 Add moving forehead controls above the face oval as a fraction of face height. Example: 0.20.
 --debug-points  Save a debug image with moving source points in red, moving destination points in green, and fixed outer anchors in blue.
 --debug-mesh    Save a debug image with destination Delaunay triangles in gray.
+--recursive     Process images in nested folders when using --input-folder.
 ```
+
+Use either single-image mode (`--input` and `--output`) or batch mode
+(`--input-folder` and `--output-folder`). Batch mode supports `.jpg`, `.jpeg`,
+`.png`, `.bmp`, `.webp`, `.tif`, and `.tiff` files, and saves each result under
+the output folder with the same relative path as the input image.
 
 `--scale-x` follows the eye-to-eye axis. `--scale-y` follows the perpendicular
 axis corrected toward the chin. The outer anchor points stay fixed so the mesh
