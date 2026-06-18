@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 import argparse
-import math
 from pathlib import Path
 
 import cv2
 import mediapipe as mp
 import numpy as np
 
-
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
 FACE_OVAL = [
     10, 338, 297, 332, 284, 251, 389, 356,
@@ -20,10 +17,8 @@ FACE_OVAL = [
 
 LEFT_EYE = [33, 133]
 RIGHT_EYE = [362, 263]
-NOSE_TIP = 1
 FOREHEAD = 10
 CHIN = 152
-SIDES = ("left", "right", "top", "bottom")
 
 
 def read_image(path):
@@ -31,6 +26,13 @@ def read_image(path):
     if img is None:
         raise RuntimeError(f"Cannot read image: {path}")
     return img
+
+
+def write_image(path, img):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(path), img):
+        raise RuntimeError(f"Cannot write image: {path}")
 
 
 def detect_landmarks_bgr(img_bgr):
@@ -61,19 +63,6 @@ def eye_center(landmarks, indices):
     return landmarks[indices].mean(axis=0)
 
 
-def face_angle(landmarks):
-    left = eye_center(landmarks, LEFT_EYE)
-    right = eye_center(landmarks, RIGHT_EYE)
-    v = right - left
-    return math.atan2(float(v[1]), float(v[0]))
-
-
-def interocular_distance(landmarks):
-    left = eye_center(landmarks, LEFT_EYE)
-    right = eye_center(landmarks, RIGHT_EYE)
-    return float(np.linalg.norm(right - left))
-
-
 def face_axes(landmarks):
     left = eye_center(landmarks, LEFT_EYE)
     right = eye_center(landmarks, RIGHT_EYE)
@@ -92,1074 +81,347 @@ def face_axes(landmarks):
     return x_axis.astype(np.float32), y_axis.astype(np.float32)
 
 
-def resolve_side_values(global_value, left=None, right=None, top=None, bottom=None):
-    values = {
-        "left": global_value if left is None else left,
-        "right": global_value if right is None else right,
-        "top": global_value if top is None else top,
-        "bottom": global_value if bottom is None else bottom,
-    }
-    return {side: int(values[side]) for side in SIDES}
+def to_local(points, center, x_axis, y_axis):
+    rel = points.astype(np.float32) - center.astype(np.float32)
+    return np.column_stack((rel @ x_axis, rel @ y_axis)).astype(np.float32)
 
 
-def resolve_side_float_values(global_value, left=None, right=None, top=None, bottom=None):
-    values = {
-        "left": global_value if left is None else left,
-        "right": global_value if right is None else right,
-        "top": global_value if top is None else top,
-        "bottom": global_value if bottom is None else bottom,
-    }
-    return {side: float(values[side]) for side in SIDES}
+def from_local(local_points, center, x_axis, y_axis):
+    local_points = local_points.astype(np.float32)
+    return (
+        center.astype(np.float32)
+        + local_points[:, 0:1] * x_axis.astype(np.float32)
+        + local_points[:, 1:2] * y_axis.astype(np.float32)
+    ).astype(np.float32)
 
 
-def normalize_side_values(values, default):
-    if values is None:
-        return resolve_side_values(default)
-    if isinstance(values, dict):
-        return {side: int(values[side]) for side in SIDES}
-    return resolve_side_values(values)
-
-
-def normalize_side_float_values(values, default):
-    if values is None:
-        return resolve_side_float_values(default)
-    if isinstance(values, dict):
-        return {side: float(values[side]) for side in SIDES}
-    return resolve_side_float_values(values)
-
-
-def side_values_are_symmetric(values):
-    return len({int(values[side]) for side in SIDES}) == 1
-
-
-def translate_mask(mask, vector):
-    h, w = mask.shape[:2]
-    M = np.array([
-        [1.0, 0.0, float(vector[0])],
-        [0.0, 1.0, float(vector[1])],
-    ], dtype=np.float32)
-    return cv2.warpAffine(
-        mask,
-        M,
-        (w, h),
-        flags=cv2.INTER_NEAREST,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0,
-    )
-
-
-def expand_mask_symmetric(mask, expand):
-    if expand == 0:
-        return mask
-
-    k = abs(int(expand)) * 2 + 1
-    kernel = np.ones((k, k), np.uint8)
-    if expand > 0:
-        return cv2.dilate(mask, kernel, iterations=1)
-    return cv2.erode(mask, kernel, iterations=1)
-
-
-def expand_mask_directional(mask, landmarks, expand):
-    if side_values_are_symmetric(expand):
-        return expand_mask_symmetric(mask, expand["left"])
-
-    x_axis, y_axis = face_axes(landmarks)
-    outward = {
-        "left": -x_axis,
-        "right": x_axis,
-        "top": -y_axis,
-        "bottom": y_axis,
-    }
-
-    for side in SIDES:
-        amount = int(expand[side])
-        if amount == 0:
-            continue
-
-        direction = outward[side]
-        if amount > 0:
-            base = mask.copy()
-            expanded = mask.copy()
-            for step in range(1, amount + 1):
-                expanded = cv2.max(expanded, translate_mask(base, direction * step))
-            mask = expanded
-        else:
-            for _ in range(abs(amount)):
-                mask = cv2.bitwise_and(mask, translate_mask(mask, -direction))
-
-    return mask
-
-
-def side_feather_widths(shape, landmarks, feather):
-    h, w = shape[:2]
-    x_axis, y_axis = face_axes(landmarks)
-    center = landmarks[FACE_OVAL].mean(axis=0)
-
-    oval = landmarks[FACE_OVAL] - center
-    oval_x = oval @ x_axis
-    oval_y = oval @ y_axis
-    min_x, max_x = float(oval_x.min()), float(oval_x.max())
-    min_y, max_y = float(oval_y.min()), float(oval_y.max())
-
-    yy, xx = np.indices((h, w), dtype=np.float32)
-    rel_x = xx - center[0]
-    rel_y = yy - center[1]
-    local_x = rel_x * x_axis[0] + rel_y * x_axis[1]
-    local_y = rel_x * y_axis[0] + rel_y * y_axis[1]
-
-    distances = np.stack([
-        np.abs(local_x - min_x),
-        np.abs(local_x - max_x),
-        np.abs(local_y - min_y),
-        np.abs(local_y - max_y),
-    ])
-    side_index = np.argmin(distances, axis=0)
-    side_widths = np.array([
-        feather["left"],
-        feather["right"],
-        feather["top"],
-        feather["bottom"],
-    ], dtype=np.float32)
-    return side_widths[side_index]
-
-
-def curve_distance_feather(mask, landmarks, feather, feather_curve):
-    binary = (mask > 127).astype(np.uint8)
-    if max(feather.values()) <= 0:
-        return binary.astype(np.float32)
-
-    inside = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
-    outside = cv2.distanceTransform(1 - binary, cv2.DIST_L2, 5)
-    signed_distance = inside - outside
-
-    if side_values_are_symmetric(feather):
-        width = np.full(mask.shape[:2], feather["left"], dtype=np.float32)
-    else:
-        width = side_feather_widths(mask.shape, landmarks, feather)
-
-    alpha = binary.astype(np.float32)
-    soft = width > 0
-    safe_width = np.maximum(width, 1.0)
-
-    if feather_curve == "gaussian":
-        curved = 0.5 * (1.0 + np.tanh(1.472 * signed_distance / safe_width))
-    else:
-        t = np.clip((signed_distance + safe_width) / (2.0 * safe_width), 0.0, 1.0)
-        if feather_curve == "smoothstep":
-            curved = t * t * (3.0 - 2.0 * t)
-        else:
-            curved = t
-
-    alpha[soft] = curved[soft]
-    return np.clip(alpha, 0.0, 1.0)
-
-
-def apply_feather(mask, landmarks, feather, feather_curve, feather_gamma):
-    if side_values_are_symmetric(feather) and feather_curve == "gaussian":
-        amount = int(feather["left"])
-        if amount > 0:
-            k = amount * 2 + 1
-            if k % 2 == 0:
-                k += 1
-            alpha = cv2.GaussianBlur(mask, (k, k), 0).astype(np.float32) / 255.0
-        else:
-            alpha = mask.astype(np.float32) / 255.0
-    else:
-        alpha = curve_distance_feather(mask, landmarks, feather, feather_curve)
-
-    if feather_gamma != 1.0:
-        alpha = np.power(np.clip(alpha, 0.0, 1.0), feather_gamma)
-
-    return np.clip(alpha, 0.0, 1.0)
-
-
-def build_affine(src_lm, dst_lm, scale_adjust=1.0, align_rotation=True, offset_x=0, offset_y=0):
-    src_anchor = src_lm[NOSE_TIP]
-    dst_anchor = dst_lm[NOSE_TIP].copy()
-    dst_anchor[0] += offset_x
-    dst_anchor[1] += offset_y
-
-    src_dist = interocular_distance(src_lm)
-    dst_dist = interocular_distance(dst_lm)
-
-    if src_dist < 1 or dst_dist < 1:
-        raise RuntimeError("Bad eye distance; face detection failed or face too small.")
-
-    scale = (dst_dist / src_dist) * scale_adjust
-
-    angle = 0.0
-    if align_rotation:
-        angle = face_angle(dst_lm) - face_angle(src_lm)
-
-    cos_a = math.cos(angle) * scale
-    sin_a = math.sin(angle) * scale
-
-    # x' = A*x + b
-    A = np.array([
-        [cos_a, -sin_a],
-        [sin_a,  cos_a],
-    ], dtype=np.float32)
-
-    b = dst_anchor - A @ src_anchor
-
-    M = np.zeros((2, 3), dtype=np.float32)
-    M[:, :2] = A
-    M[:, 2] = b
-
-    return M
-
-
-def create_face_mask(
-    shape,
-    landmarks,
-    expand=None,
-    feather=None,
-    feather_curve="gaussian",
-    feather_gamma=1.0,
-):
-    feather = normalize_side_values(feather, 12)
-
-    mask = create_face_mask_binary(shape, landmarks, expand=expand)
-    return apply_feather(mask, landmarks, feather, feather_curve, feather_gamma)
-
-
-def create_face_mask_binary(shape, landmarks, expand=None):
-    h, w = shape[:2]
-    expand = normalize_side_values(expand, 0)
-
-    oval = landmarks[FACE_OVAL].astype(np.int32)
-    hull = cv2.convexHull(oval)
-
-    mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.fillConvexPoly(mask, hull, 255)
-
-    return expand_mask_directional(mask, landmarks, expand)
-
-
-def circular_interpolate_missing(values):
-    valid = np.isfinite(values)
-    if valid.all():
-        return values.astype(np.float32)
-    if not valid.any():
-        return np.zeros_like(values, dtype=np.float32)
-
-    n = len(values)
-    idx = np.arange(n, dtype=np.float32)
-    valid_idx = idx[valid]
-    valid_values = values[valid]
-
-    interp_idx = np.concatenate([valid_idx - n, valid_idx, valid_idx + n])
-    interp_values = np.concatenate([valid_values, valid_values, valid_values])
-    return np.interp(idx, interp_idx, interp_values).astype(np.float32)
-
-
-def radial_mask_extent(mask, center, angle_bins):
-    ys, xs = np.nonzero(mask > 127)
-    extents = np.full(angle_bins, -np.inf, dtype=np.float32)
-    if len(xs) == 0:
-        extents[:] = np.nan
-        return circular_interpolate_missing(extents)
-
-    dx = xs.astype(np.float32) - float(center[0])
-    dy = ys.astype(np.float32) - float(center[1])
-    radii = np.hypot(dx, dy)
-    angles = (np.arctan2(dy, dx) + (2.0 * math.pi)) % (2.0 * math.pi)
-    bins = np.floor(angles / (2.0 * math.pi) * angle_bins).astype(np.int32) % angle_bins
-    np.maximum.at(extents, bins, radii)
-    extents[~np.isfinite(extents)] = np.nan
-    return circular_interpolate_missing(extents)
-
-
-def feather_alpha_mask(mask, feather, gamma):
-    alpha = mask.astype(np.float32) / 255.0
-
-    amount = int(feather)
-    if amount > 0:
-        k = amount * 2 + 1
-        if k % 2 == 0:
-            k += 1
-        alpha = cv2.GaussianBlur(mask, (k, k), 0).astype(np.float32) / 255.0
-
-    if gamma != 1.0:
-        alpha = np.power(np.clip(alpha, 0.0, 1.0), gamma)
-
-    return np.clip(alpha, 0.0, 1.0)
-
-
-def radial_stretch_gap(target, old_face_mask, new_face_mask, center, landmarks, stretch, stretch_feather, stretch_gamma):
-    stretch = normalize_side_float_values(stretch, 0.0)
-    if max(stretch.values()) <= 0:
-        return target
-
-    h, w = target.shape[:2]
-    corners = np.array([
-        [0.0, 0.0],
-        [float(w - 1), 0.0],
-        [0.0, float(h - 1)],
-        [float(w - 1), float(h - 1)],
-    ], dtype=np.float32)
-    max_radius = float(np.max(np.linalg.norm(corners - center.astype(np.float32), axis=1)))
-    angle_bins = max(720, min(16384, int(max_radius * 4)))
-
-    old_extent = radial_mask_extent(old_face_mask, center, angle_bins)
-    new_extent = radial_mask_extent(new_face_mask, center, angle_bins)
-    stretch_factor = side_feather_widths(target.shape, landmarks, stretch)
-
-    yy, xx = np.indices((h, w), dtype=np.float32)
-    dx = xx - float(center[0])
-    dy = yy - float(center[1])
-    radii = np.hypot(dx, dy)
-    valid_radius = radii > 1e-3
-
-    angles = (np.arctan2(dy, dx) + (2.0 * math.pi)) % (2.0 * math.pi)
-    bins = np.floor(angles / (2.0 * math.pi) * angle_bins).astype(np.int32) % angle_bins
-    old_r = old_extent[bins]
-    new_r = new_extent[bins]
-    gap_width = old_r - new_r
-    source_width = gap_width * stretch_factor
-
-    band = (
-        valid_radius
-        & (gap_width > 1e-3)
-        & (source_width > 0)
-        & (radii >= new_r)
-        & (radii <= old_r + source_width)
-        & (new_face_mask <= 127)
-    )
-    if not np.any(band):
-        return target
-
-    map_x = xx.copy()
-    map_y = yy.copy()
-    destination_width = gap_width[band] + source_width[band]
-    t = np.clip((radii[band] - new_r[band]) / np.maximum(destination_width, 1e-3), 0.0, 1.0)
-    sample_r = old_r[band] + (t * source_width[band])
-    unit_x = dx[band] / radii[band]
-    unit_y = dy[band] / radii[band]
-
-    map_x[band] = float(center[0]) + unit_x * sample_r
-    map_y[band] = float(center[1]) + unit_y * sample_r
-
-    stretched = cv2.remap(
-        target,
-        map_x,
-        map_y,
-        interpolation=cv2.INTER_CUBIC,
-        borderMode=cv2.BORDER_REFLECT_101,
-    )
-
-    band_mask = (band.astype(np.uint8) * 255)
-    alpha = feather_alpha_mask(band_mask, stretch_feather, stretch_gamma)
-    alpha[~band] = 0.0
-    alpha = alpha[:, :, None]
-    result = stretched.astype(np.float32) * alpha + target.astype(np.float32) * (1.0 - alpha)
-    return np.clip(result, 0, 255).astype(np.uint8)
-
-
-def radial_compact_expansion(target, old_face_mask, new_face_mask, center, landmarks, stretch, stretch_feather, stretch_gamma):
-    stretch = normalize_side_float_values(stretch, 0.0)
-    if max(stretch.values()) <= 0:
-        return target
-
-    h, w = target.shape[:2]
-    corners = np.array([
-        [0.0, 0.0],
-        [float(w - 1), 0.0],
-        [0.0, float(h - 1)],
-        [float(w - 1), float(h - 1)],
-    ], dtype=np.float32)
-    max_radius = float(np.max(np.linalg.norm(corners - center.astype(np.float32), axis=1)))
-    angle_bins = max(720, min(16384, int(max_radius * 4)))
-
-    old_extent = radial_mask_extent(old_face_mask, center, angle_bins)
-    new_extent = radial_mask_extent(new_face_mask, center, angle_bins)
-    stretch_factor = side_feather_widths(target.shape, landmarks, stretch)
-
-    yy, xx = np.indices((h, w), dtype=np.float32)
-    dx = xx - float(center[0])
-    dy = yy - float(center[1])
-    radii = np.hypot(dx, dy)
-    valid_radius = radii > 1e-3
-
-    angles = (np.arctan2(dy, dx) + (2.0 * math.pi)) % (2.0 * math.pi)
-    bins = np.floor(angles / (2.0 * math.pi) * angle_bins).astype(np.int32) % angle_bins
-    old_r = old_extent[bins]
-    new_r = new_extent[bins]
-    expansion_width = new_r - old_r
-    source_width = expansion_width * stretch_factor
-
-    band = (
-        valid_radius
-        & (new_r > old_r)
-        & (source_width > 0)
-        & (radii >= new_r)
-        & (radii <= new_r + source_width)
-        & (new_face_mask <= 127)
-    )
-    if not np.any(band):
-        return target
-
-    map_x = xx.copy()
-    map_y = yy.copy()
-    band_source_width = source_width[band]
-    u = np.clip((radii[band] - new_r[band]) / np.maximum(band_source_width, 1e-3), 0.0, 1.0)
-    sample_r = old_r[band] + u * ((new_r[band] + band_source_width) - old_r[band])
-    unit_x = dx[band] / radii[band]
-    unit_y = dy[band] / radii[band]
-
-    map_x[band] = float(center[0]) + unit_x * sample_r
-    map_y[band] = float(center[1]) + unit_y * sample_r
-
-    compacted = cv2.remap(
-        target,
-        map_x,
-        map_y,
-        interpolation=cv2.INTER_CUBIC,
-        borderMode=cv2.BORDER_REFLECT_101,
-    )
-
-    band_mask = (band.astype(np.uint8) * 255)
-    alpha = feather_alpha_mask(band_mask, stretch_feather, stretch_gamma)
-    alpha[~band] = 0.0
-    alpha = alpha[:, :, None]
-    result = compacted.astype(np.float32) * alpha + target.astype(np.float32) * (1.0 - alpha)
-    return np.clip(result, 0, 255).astype(np.uint8)
-
-
-def face_local_mask_bbox(mask, center, x_axis, y_axis):
-    ys, xs = np.nonzero(mask > 127)
-    if len(xs) == 0:
-        return None
-    dx = xs.astype(np.float32) - float(center[0])
-    dy = ys.astype(np.float32) - float(center[1])
-    local_x = dx * x_axis[0] + dy * x_axis[1]
-    local_y = dx * y_axis[0] + dy * y_axis[1]
+def clip_point_to_image(point, width, height):
     return np.array([
-        float(local_x.min()),
-        float(local_y.min()),
-        float(local_x.max()),
-        float(local_y.max()),
+        np.clip(point[0], 0.0, float(width - 1)),
+        np.clip(point[1], 0.0, float(height - 1)),
     ], dtype=np.float32)
 
 
-def blend_warped_region(target, warped, active, feather, gamma):
-    active_mask = (active.astype(np.uint8) * 255)
-    alpha = feather_alpha_mask(active_mask, feather, gamma)
-    alpha[~active] = 0.0
-    alpha = alpha[:, :, None]
-    result = warped.astype(np.float32) * alpha + target.astype(np.float32) * (1.0 - alpha)
-    return np.clip(result, 0, 255).astype(np.uint8)
+def make_anchor_points(oval_points, center, x_axis, y_axis, width, height, anchor_scale, samples_per_side=9):
+    local = to_local(oval_points, center, x_axis, y_axis)
+    min_x, min_y = local.min(axis=0)
+    max_x, max_y = local.max(axis=0)
+
+    box_center_x = (min_x + max_x) * 0.5
+    box_center_y = (min_y + max_y) * 0.5
+    half_w = (max_x - min_x) * 0.5
+    half_h = (max_y - min_y) * 0.5
+
+    left = box_center_x - half_w * anchor_scale
+    right = box_center_x + half_w * anchor_scale
+    top = box_center_y - half_h * anchor_scale
+    bottom = box_center_y + half_h * anchor_scale
+
+    xs = np.linspace(left, right, samples_per_side, dtype=np.float32)
+    ys = np.linspace(top, bottom, samples_per_side, dtype=np.float32)
+    local_anchors = []
+
+    for x in xs:
+        local_anchors.append([x, top])
+        local_anchors.append([x, bottom])
+    for y in ys[1:-1]:
+        local_anchors.append([left, y])
+        local_anchors.append([right, y])
+
+    anchors = from_local(np.array(local_anchors, dtype=np.float32), center, x_axis, y_axis)
+    return np.array([clip_point_to_image(p, width, height) for p in anchors], dtype=np.float32)
 
 
-def box_stretch_shrink(target, old_face_mask, new_face_mask, landmarks, stretch, stretch_feather, stretch_gamma):
-    stretch = normalize_side_float_values(stretch, 0.0)
-    if max(stretch.values()) <= 0:
-        return target
+def make_forehead_points(oval_points, center, x_axis, y_axis, forehead_expand, samples=9):
+    if forehead_expand <= 0:
+        return np.empty((0, 2), dtype=np.float32)
 
+    local = to_local(oval_points, center, x_axis, y_axis)
+    min_x, min_y = local.min(axis=0)
+    max_x, max_y = local.max(axis=0)
+
+    box_center_x = (min_x + max_x) * 0.5
+    half_w = (max_x - min_x) * 0.5 * 0.85
+    face_h = max_y - min_y
+    forehead_y = min_y - face_h * forehead_expand
+
+    xs = np.linspace(box_center_x - half_w, box_center_x + half_w, samples, dtype=np.float32)
+    src_local = np.column_stack((xs, np.full(samples, forehead_y, dtype=np.float32))).astype(np.float32)
+    return from_local(src_local, center, x_axis, y_axis)
+
+
+def add_unique_control(src_points, dst_points, src, dst, min_distance=0.25):
+    if dst_points:
+        existing = np.array(dst_points, dtype=np.float32)
+        if float(np.min(np.linalg.norm(existing - dst, axis=1))) < min_distance:
+            return
+    src_points.append(src.astype(np.float32))
+    dst_points.append(dst.astype(np.float32))
+
+
+def build_control_points(landmarks, width, height, scale_x, scale_y, anchor_scale, forehead_expand):
     center = landmarks[FACE_OVAL].mean(axis=0).astype(np.float32)
     x_axis, y_axis = face_axes(landmarks)
-    old_box = face_local_mask_bbox(old_face_mask, center, x_axis, y_axis)
-    new_box = face_local_mask_bbox(new_face_mask, center, x_axis, y_axis)
-    if old_box is None or new_box is None:
-        return target
 
-    old_left, old_top, old_right, old_bottom = old_box
-    new_left, new_top, new_right, new_bottom = new_box
+    oval_src = landmarks[FACE_OVAL].astype(np.float32)
+    oval_local = to_local(oval_src, center, x_axis, y_axis)
+    oval_dst_local = oval_local.copy()
+    oval_dst_local[:, 0] *= scale_x
+    oval_dst_local[:, 1] *= scale_y
+    oval_dst = from_local(oval_dst_local, center, x_axis, y_axis)
 
-    gap_left = max(new_left - old_left, 0.0)
-    gap_right = max(old_right - new_right, 0.0)
-    gap_top = max(new_top - old_top, 0.0)
-    gap_bottom = max(old_bottom - new_bottom, 0.0)
+    forehead_src = make_forehead_points(
+        oval_src,
+        center,
+        x_axis,
+        y_axis,
+        forehead_expand,
+    )
+    if len(forehead_src) > 0:
+        forehead_src = np.array([clip_point_to_image(p, width, height) for p in forehead_src], dtype=np.float32)
+    forehead_dst = np.empty((0, 2), dtype=np.float32)
+    if len(forehead_src) > 0:
+        forehead_dst_local = to_local(forehead_src, center, x_axis, y_axis)
+        forehead_dst_local[:, 0] *= scale_x
+        forehead_dst_local[:, 1] *= scale_y
+        forehead_dst = from_local(forehead_dst_local, center, x_axis, y_axis)
 
-    source_left = gap_left * stretch["left"]
-    source_right = gap_right * stretch["right"]
-    source_top = gap_top * stretch["top"]
-    source_bottom = gap_bottom * stretch["bottom"]
-
-    if max(source_left, source_right, source_top, source_bottom) <= 0:
-        return target
-
-    h, w = target.shape[:2]
-    yy, xx = np.indices((h, w), dtype=np.float32)
-    dx = xx - float(center[0])
-    dy = yy - float(center[1])
-    local_x = dx * x_axis[0] + dy * x_axis[1]
-    local_y = dx * y_axis[0] + dy * y_axis[1]
-    sample_local_x = local_x.copy()
-    sample_local_y = local_y.copy()
-
-    outer_left = old_left - source_left
-    outer_right = old_right + source_right
-    outer_top = old_top - source_top
-    outer_bottom = old_bottom + source_bottom
-
-    active = (
-        (local_x >= outer_left)
-        & (local_x <= outer_right)
-        & (local_y >= outer_top)
-        & (local_y <= outer_bottom)
-        & (new_face_mask <= 127)
+    anchors = make_anchor_points(
+        oval_src,
+        center,
+        x_axis,
+        y_axis,
+        width,
+        height,
+        anchor_scale,
     )
 
-    if source_left > 0 and gap_left > 0:
-        dst0 = outer_left
-        dst1 = new_left
-        src0 = outer_left
-        src1 = old_left
-        region = active & (local_x >= dst0) & (local_x <= dst1)
-        sample_local_x[region] = src0 + (local_x[region] - dst0) * ((src1 - src0) / max(dst1 - dst0, 1e-3))
+    src_points = []
+    dst_points = []
+    point_kinds = []
 
-    if source_right > 0 and gap_right > 0:
-        dst0 = new_right
-        dst1 = outer_right
-        src0 = old_right
-        src1 = outer_right
-        region = active & (local_x >= dst0) & (local_x <= dst1)
-        sample_local_x[region] = src0 + (local_x[region] - dst0) * ((src1 - src0) / max(dst1 - dst0, 1e-3))
+    for src, dst in zip(oval_src, oval_dst):
+        before = len(dst_points)
+        add_unique_control(src_points, dst_points, src, clip_point_to_image(dst, width, height))
+        if len(dst_points) > before:
+            point_kinds.append("oval")
 
-    if source_top > 0 and gap_top > 0:
-        dst0 = outer_top
-        dst1 = new_top
-        src0 = outer_top
-        src1 = old_top
-        region = active & (local_y >= dst0) & (local_y <= dst1)
-        sample_local_y[region] = src0 + (local_y[region] - dst0) * ((src1 - src0) / max(dst1 - dst0, 1e-3))
+    for src, dst in zip(forehead_src, forehead_dst):
+        before = len(dst_points)
+        add_unique_control(src_points, dst_points, src, clip_point_to_image(dst, width, height))
+        if len(dst_points) > before:
+            point_kinds.append("forehead")
 
-    if source_bottom > 0 and gap_bottom > 0:
-        dst0 = new_bottom
-        dst1 = outer_bottom
-        src0 = old_bottom
-        src1 = outer_bottom
-        region = active & (local_y >= dst0) & (local_y <= dst1)
-        sample_local_y[region] = src0 + (local_y[region] - dst0) * ((src1 - src0) / max(dst1 - dst0, 1e-3))
+    for anchor in anchors:
+        before = len(dst_points)
+        add_unique_control(src_points, dst_points, anchor, anchor)
+        if len(dst_points) > before:
+            point_kinds.append("anchor")
 
-    map_x = float(center[0]) + sample_local_x * x_axis[0] + sample_local_y * y_axis[0]
-    map_y = float(center[1]) + sample_local_x * x_axis[1] + sample_local_y * y_axis[1]
-
-    warped = cv2.remap(
-        target,
-        map_x,
-        map_y,
-        interpolation=cv2.INTER_CUBIC,
-        borderMode=cv2.BORDER_REFLECT_101,
-    )
-    return blend_warped_region(target, warped, active, stretch_feather, stretch_gamma)
-
-
-def box_compact_expansion(target, old_face_mask, new_face_mask, landmarks, stretch, stretch_feather, stretch_gamma):
-    stretch = normalize_side_float_values(stretch, 0.0)
-    if max(stretch.values()) <= 0:
-        return target
-
-    center = landmarks[FACE_OVAL].mean(axis=0).astype(np.float32)
-    x_axis, y_axis = face_axes(landmarks)
-    old_box = face_local_mask_bbox(old_face_mask, center, x_axis, y_axis)
-    new_box = face_local_mask_bbox(new_face_mask, center, x_axis, y_axis)
-    if old_box is None or new_box is None:
-        return target
-
-    old_left, old_top, old_right, old_bottom = old_box
-    new_left, new_top, new_right, new_bottom = new_box
-
-    gap_left = max(old_left - new_left, 0.0)
-    gap_right = max(new_right - old_right, 0.0)
-    gap_top = max(old_top - new_top, 0.0)
-    gap_bottom = max(new_bottom - old_bottom, 0.0)
-
-    dest_left = gap_left * stretch["left"]
-    dest_right = gap_right * stretch["right"]
-    dest_top = gap_top * stretch["top"]
-    dest_bottom = gap_bottom * stretch["bottom"]
-
-    if max(dest_left, dest_right, dest_top, dest_bottom) <= 0:
-        return target
-
-    h, w = target.shape[:2]
-    yy, xx = np.indices((h, w), dtype=np.float32)
-    dx = xx - float(center[0])
-    dy = yy - float(center[1])
-    local_x = dx * x_axis[0] + dy * x_axis[1]
-    local_y = dx * y_axis[0] + dy * y_axis[1]
-    sample_local_x = local_x.copy()
-    sample_local_y = local_y.copy()
-
-    outer_left = new_left - dest_left
-    outer_right = new_right + dest_right
-    outer_top = new_top - dest_top
-    outer_bottom = new_bottom + dest_bottom
-
-    active = (
-        (local_x >= outer_left)
-        & (local_x <= outer_right)
-        & (local_y >= outer_top)
-        & (local_y <= outer_bottom)
-        & (new_face_mask <= 127)
+    return (
+        np.array(src_points, dtype=np.float32),
+        np.array(dst_points, dtype=np.float32),
+        point_kinds,
+        center,
+        x_axis,
+        y_axis,
     )
 
-    if dest_left > 0 and gap_left > 0:
-        dst0 = outer_left
-        dst1 = new_left
-        src0 = new_left
-        src1 = old_left
-        region = active & (local_x >= dst0) & (local_x <= dst1)
-        sample_local_x[region] = src0 + (local_x[region] - dst0) * ((src1 - src0) / max(dst1 - dst0, 1e-3))
 
-    if dest_right > 0 and gap_right > 0:
-        dst0 = new_right
-        dst1 = outer_right
-        src0 = old_right
-        src1 = new_right
-        region = active & (local_x >= dst0) & (local_x <= dst1)
-        sample_local_x[region] = src0 + (local_x[region] - dst0) * ((src1 - src0) / max(dst1 - dst0, 1e-3))
-
-    if dest_top > 0 and gap_top > 0:
-        dst0 = outer_top
-        dst1 = new_top
-        src0 = new_top
-        src1 = old_top
-        region = active & (local_y >= dst0) & (local_y <= dst1)
-        sample_local_y[region] = src0 + (local_y[region] - dst0) * ((src1 - src0) / max(dst1 - dst0, 1e-3))
-
-    if dest_bottom > 0 and gap_bottom > 0:
-        dst0 = new_bottom
-        dst1 = outer_bottom
-        src0 = old_bottom
-        src1 = new_bottom
-        region = active & (local_y >= dst0) & (local_y <= dst1)
-        sample_local_y[region] = src0 + (local_y[region] - dst0) * ((src1 - src0) / max(dst1 - dst0, 1e-3))
-
-    map_x = float(center[0]) + sample_local_x * x_axis[0] + sample_local_y * y_axis[0]
-    map_y = float(center[1]) + sample_local_x * x_axis[1] + sample_local_y * y_axis[1]
-
-    warped = cv2.remap(
-        target,
-        map_x,
-        map_y,
-        interpolation=cv2.INTER_CUBIC,
-        borderMode=cv2.BORDER_REFLECT_101,
-    )
-    return blend_warped_region(target, warped, active, stretch_feather, stretch_gamma)
+def point_inside_image(point, width, height):
+    return 0.0 <= point[0] < width and 0.0 <= point[1] < height
 
 
-def optional_color_match(src_warped, target, mask):
-    # Simple mean/std match inside the mask. Not perfect, but helps.
-    m = mask > 0.2
-    if m.sum() < 100:
-        return src_warped
-
-    out = src_warped.astype(np.float32)
-    tgt = target.astype(np.float32)
-
-    for c in range(3):
-        src_vals = out[:, :, c][m]
-        tgt_vals = tgt[:, :, c][m]
-
-        src_mean, src_std = src_vals.mean(), src_vals.std() + 1e-6
-        tgt_mean, tgt_std = tgt_vals.mean(), tgt_vals.std() + 1e-6
-
-        out[:, :, c] = (out[:, :, c] - src_mean) / src_std * tgt_std + tgt_mean
-
-    return np.clip(out, 0, 255).astype(np.uint8)
+def nearest_point_index(point, points, max_distance=2.0):
+    distances = np.linalg.norm(points - point.astype(np.float32), axis=1)
+    index = int(np.argmin(distances))
+    if float(distances[index]) > max_distance:
+        return None
+    return index
 
 
-def resize_face_image(
-    source_path,
-    target_path,
-    output_path,
-    scale,
-    offset_x,
-    offset_y,
-    mask_expand,
-    feather,
-    feather_curve,
-    feather_gamma,
-    align_rotation,
-    color_match,
-    mode,
-    stretch,
-    stretch_feather,
-    stretch_gamma,
-    stretch_mode,
-    debug_mask_path=None,
-):
-    source = read_image(source_path)
-    target = read_image(target_path)
-    stretch = normalize_side_float_values(stretch, 0.0)
-
-    src_lm = detect_landmarks_bgr(source)
-    dst_lm = detect_landmarks_bgr(target)
-
-    if src_lm is None:
-        raise RuntimeError("No face detected in source image.")
-    if dst_lm is None:
-        raise RuntimeError("No face detected in target image.")
-
-    M = build_affine(
-        src_lm,
-        dst_lm,
-        scale_adjust=scale,
-        align_rotation=align_rotation,
-        offset_x=offset_x,
-        offset_y=offset_y,
-    )
-
-    th, tw = target.shape[:2]
-
-    src_hard_mask = create_face_mask_binary(source.shape, src_lm, expand=0)
-    target_hard_mask = create_face_mask_binary(target.shape, dst_lm, expand=0)
-    if mode == "stretch":
-        src_mask = src_hard_mask.astype(np.float32) / 255.0
-        mask_warp_flags = cv2.INTER_NEAREST
-        stretch_feather = 0
-        stretch_gamma = 1.0
-    else:
-        src_mask = create_face_mask(
-            source.shape,
-            src_lm,
-            expand=mask_expand,
-            feather=feather,
-            feather_curve=feather_curve,
-            feather_gamma=feather_gamma,
-        )
-        mask_warp_flags = cv2.INTER_LINEAR
-
-    warped_face = cv2.warpAffine(
-        source,
-        M,
-        (tw, th),
-        flags=cv2.INTER_CUBIC,
-        borderMode=cv2.BORDER_REFLECT_101,
-    )
-
-    warped_mask = cv2.warpAffine(
-        src_mask,
-        M,
-        (tw, th),
-        flags=mask_warp_flags,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0,
-    )
-
-    warped_mask = np.clip(warped_mask, 0.0, 1.0)
-    warped_hard_mask = cv2.warpAffine(
-        src_hard_mask,
-        M,
-        (tw, th),
-        flags=cv2.INTER_NEAREST,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0,
-    )
-
-    composite_target = target
-    if max(stretch.values()) > 0:
-        if stretch_mode not in ("box", "radial"):
-            raise RuntimeError(f"Unsupported stretch mode: {stretch_mode}")
-        face_center = dst_lm[FACE_OVAL].mean(axis=0).astype(np.float32)
-        if scale < 1.0:
-            if stretch_mode == "box":
-                composite_target = box_stretch_shrink(
-                    target,
-                    target_hard_mask,
-                    warped_hard_mask,
-                    dst_lm,
-                    stretch,
-                    stretch_feather,
-                    stretch_gamma,
-                )
-            else:
-                composite_target = radial_stretch_gap(
-                    target,
-                    target_hard_mask,
-                    warped_hard_mask,
-                    face_center,
-                    dst_lm,
-                    stretch,
-                    stretch_feather,
-                    stretch_gamma,
-                )
-        elif scale > 1.0:
-            if stretch_mode == "box":
-                composite_target = box_compact_expansion(
-                    target,
-                    target_hard_mask,
-                    warped_hard_mask,
-                    dst_lm,
-                    stretch,
-                    stretch_feather,
-                    stretch_gamma,
-                )
-            else:
-                composite_target = radial_compact_expansion(
-                    target,
-                    target_hard_mask,
-                    warped_hard_mask,
-                    face_center,
-                    dst_lm,
-                    stretch,
-                    stretch_feather,
-                    stretch_gamma,
-                )
-
-    if color_match:
-        warped_face = optional_color_match(warped_face, composite_target, warped_mask)
-
-    alpha = warped_mask[:, :, None]
-    result = warped_face.astype(np.float32) * alpha + composite_target.astype(np.float32) * (1.0 - alpha)
-    result = np.clip(result, 0, 255).astype(np.uint8)
-
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    if not cv2.imwrite(str(output_path), result):
-        raise RuntimeError(f"Cannot write output image: {output_path}")
-
-    if debug_mask_path:
-        debug_mask_path = Path(debug_mask_path)
-        debug_mask_path.parent.mkdir(parents=True, exist_ok=True)
-        if not cv2.imwrite(str(debug_mask_path), (warped_mask * 255).astype(np.uint8)):
-            raise RuntimeError(f"Cannot write debug mask: {debug_mask_path}")
+def triangle_area(tri):
+    a, b, c = tri
+    return abs(float(np.cross(b - a, c - a))) * 0.5
 
 
-def iter_image_paths(folder, recursive=False):
-    folder = Path(folder)
-    pattern = "**/*" if recursive else "*"
-    for path in sorted(folder.glob(pattern)):
-        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
-            yield path
+def delaunay_triangles(dst_points, width, height):
+    subdiv = cv2.Subdiv2D((0, 0, width, height))
+    for point in dst_points:
+        if point_inside_image(point, width, height):
+            subdiv.insert((float(point[0]), float(point[1])))
 
+    raw_triangles = subdiv.getTriangleList()
+    triangles = []
+    seen = set()
 
-def output_path_for(input_path, input_folder, output_folder):
-    rel_path = input_path.relative_to(input_folder)
-    return Path(output_folder) / rel_path
-
-
-def debug_mask_path_for(input_path, input_folder, debug_mask_folder):
-    rel_path = input_path.relative_to(input_folder)
-    return Path(debug_mask_folder) / rel_path.with_name(f"{rel_path.stem}_mask.png")
-
-
-def run_single(args):
-    stretch_global = args.stretch
-    if stretch_global is None:
-        stretch_global = 1.0 if args.mode == "stretch" else 0.0
-
-    mask_expand = resolve_side_values(
-        args.mask_expand,
-        left=args.mask_expand_left,
-        right=args.mask_expand_right,
-        top=args.mask_expand_top,
-        bottom=args.mask_expand_bottom,
-    )
-    feather = resolve_side_values(
-        args.feather,
-        left=args.feather_left,
-        right=args.feather_right,
-        top=args.feather_top,
-        bottom=args.feather_bottom,
-    )
-    stretch = resolve_side_float_values(
-        stretch_global,
-        left=args.stretch_left,
-        right=args.stretch_right,
-        top=args.stretch_top,
-        bottom=args.stretch_bottom,
-    )
-
-    resize_face_image(
-        source_path=args.source,
-        target_path=args.target,
-        output_path=args.output,
-        scale=args.scale,
-        offset_x=args.offset_x,
-        offset_y=args.offset_y,
-        mask_expand=mask_expand,
-        feather=feather,
-        feather_curve=args.feather_curve,
-        feather_gamma=args.feather_gamma,
-        align_rotation=not args.no_rotate,
-        color_match=args.color_match,
-        mode=args.mode,
-        stretch=stretch,
-        stretch_feather=args.stretch_feather,
-        stretch_gamma=args.stretch_gamma,
-        stretch_mode=args.stretch_mode,
-        debug_mask_path=args.debug_mask,
-    )
-
-    print("saved:", Path(args.output))
-
-
-def run_batch(args):
-    stretch_global = args.stretch
-    if stretch_global is None:
-        stretch_global = 1.0 if args.mode == "stretch" else 0.0
-
-    input_folder = Path(args.input_folder)
-    output_folder = Path(args.output_folder)
-    mask_expand = resolve_side_values(
-        args.mask_expand,
-        left=args.mask_expand_left,
-        right=args.mask_expand_right,
-        top=args.mask_expand_top,
-        bottom=args.mask_expand_bottom,
-    )
-    feather = resolve_side_values(
-        args.feather,
-        left=args.feather_left,
-        right=args.feather_right,
-        top=args.feather_top,
-        bottom=args.feather_bottom,
-    )
-    stretch = resolve_side_float_values(
-        stretch_global,
-        left=args.stretch_left,
-        right=args.stretch_right,
-        top=args.stretch_top,
-        bottom=args.stretch_bottom,
-    )
-
-    if not input_folder.is_dir():
-        raise RuntimeError(f"Input folder does not exist or is not a directory: {input_folder}")
-
-    image_paths = list(iter_image_paths(input_folder, recursive=args.recursive))
-    if not image_paths:
-        raise RuntimeError(f"No supported images found in folder: {input_folder}")
-
-    saved = 0
-    failed = 0
-
-    for index, input_path in enumerate(image_paths, start=1):
-        output_path = output_path_for(input_path, input_folder, output_folder)
-        debug_mask_path = None
-        if args.debug_mask_folder:
-            debug_mask_path = debug_mask_path_for(input_path, input_folder, args.debug_mask_folder)
-
-        print(f"[{index}/{len(image_paths)}] processing: {input_path}")
-
-        try:
-            resize_face_image(
-                source_path=input_path,
-                target_path=input_path,
-                output_path=output_path,
-                scale=args.scale,
-                offset_x=args.offset_x,
-                offset_y=args.offset_y,
-                mask_expand=mask_expand,
-                feather=feather,
-                feather_curve=args.feather_curve,
-                feather_gamma=args.feather_gamma,
-                align_rotation=not args.no_rotate,
-                color_match=args.color_match,
-                mode=args.mode,
-                stretch=stretch,
-                stretch_feather=args.stretch_feather,
-                stretch_gamma=args.stretch_gamma,
-                stretch_mode=args.stretch_mode,
-                debug_mask_path=debug_mask_path,
-            )
-        except Exception as exc:
-            failed += 1
-            print(f"failed: {input_path}: {exc}")
+    for raw in raw_triangles:
+        tri = raw.reshape(3, 2).astype(np.float32)
+        if not all(point_inside_image(p, width, height) for p in tri):
             continue
 
-        saved += 1
-        print("saved:", output_path)
+        indices = []
+        for vertex in tri:
+            index = nearest_point_index(vertex, dst_points)
+            if index is None:
+                indices = []
+                break
+            indices.append(index)
 
-    if failed:
-        raise RuntimeError(f"Batch finished with failures: saved {saved}, failed {failed}")
+        if len(indices) != 3 or len(set(indices)) != 3:
+            continue
 
-    print(f"batch complete: saved {saved} image(s) to {output_folder}")
+        key = tuple(sorted(indices))
+        if key in seen:
+            continue
+
+        dst_tri = dst_points[list(indices)]
+        if triangle_area(dst_tri) < 1.0:
+            continue
+
+        seen.add(key)
+        triangles.append(tuple(indices))
+
+    return triangles
 
 
-def validate_args(ap, args):
-    feather_values = [
-        args.feather,
-        args.feather_left,
-        args.feather_right,
-        args.feather_top,
-        args.feather_bottom,
-    ]
-    if any(value is not None and value < 0 for value in feather_values):
-        ap.error("--feather and directional feather values must be >= 0")
-    if args.feather_gamma <= 0:
-        ap.error("--feather-gamma must be > 0")
-    stretch_values = [
-        args.stretch,
-        args.stretch_left,
-        args.stretch_right,
-        args.stretch_top,
-        args.stretch_bottom,
-    ]
-    if any(value is not None and value < 0 for value in stretch_values):
-        ap.error("--stretch and directional stretch values must be >= 0")
-    if args.stretch_feather < 0:
-        ap.error("--stretch-feather must be >= 0")
-    if args.stretch_gamma <= 0:
-        ap.error("--stretch-gamma must be > 0")
+def roi_from_points(points, width, height, padding=4):
+    min_xy = np.floor(points.min(axis=0) - padding).astype(int)
+    max_xy = np.ceil(points.max(axis=0) + padding).astype(int)
 
-    batch_args = [args.input_folder, args.output_folder]
-    batch_mode = any(batch_args)
+    x0 = int(np.clip(min_xy[0], 0, width - 1))
+    y0 = int(np.clip(min_xy[1], 0, height - 1))
+    x1 = int(np.clip(max_xy[0] + 1, x0 + 1, width))
+    y1 = int(np.clip(max_xy[1] + 1, y0 + 1, height))
+    return x0, y0, x1, y1
 
-    if batch_mode:
-        if not all(batch_args):
-            ap.error("--input-folder and --output-folder must be used together")
-        if args.source or args.target or args.output:
-            ap.error("Use either --input-folder/--output-folder or --source/--target/--output, not both")
-        if args.debug_mask:
-            ap.error("--debug-mask is only for single-image mode; use --debug-mask-folder for batch mode")
-        return "batch"
 
-    if not args.source or not args.target or not args.output:
-        ap.error("single-image mode requires --source, --target, and --output")
-    if args.recursive:
-        ap.error("--recursive can only be used with --input-folder")
-    if args.debug_mask_folder:
-        ap.error("--debug-mask-folder can only be used with --input-folder")
-    return "single"
+def warp_triangle_roi(src_roi, dst_roi, src_tri, dst_tri):
+    matrix = cv2.getAffineTransform(src_tri.astype(np.float32), dst_tri.astype(np.float32))
+    warped = cv2.warpAffine(
+        src_roi,
+        matrix,
+        (dst_roi.shape[1], dst_roi.shape[0]),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REFLECT_101,
+    )
+
+    mask = np.zeros(dst_roi.shape[:2], dtype=np.uint8)
+    cv2.fillConvexPoly(mask, np.round(dst_tri).astype(np.int32), 255, lineType=cv2.LINE_AA)
+    dst_roi[mask > 0] = warped[mask > 0]
+
+
+def warp_mesh(img, src_points, dst_points, triangles):
+    h, w = img.shape[:2]
+    x0, y0, x1, y1 = roi_from_points(np.vstack((src_points, dst_points)), w, h)
+    offset = np.array([x0, y0], dtype=np.float32)
+
+    src_roi = img[y0:y1, x0:x1]
+    dst_roi = src_roi.copy()
+
+    for indices in triangles:
+        src_tri = src_points[list(indices)] - offset
+        dst_tri = dst_points[list(indices)] - offset
+        if triangle_area(src_tri) < 1.0 or triangle_area(dst_tri) < 1.0:
+            continue
+        warp_triangle_roi(src_roi, dst_roi, src_tri, dst_tri)
+
+    result = img.copy()
+    result[y0:y1, x0:x1] = dst_roi
+    return result
+
+
+def draw_debug_points(img, src_points, dst_points, point_kinds):
+    debug = img.copy()
+    for src, dst, kind in zip(src_points, dst_points, point_kinds):
+        if kind == "anchor":
+            cv2.circle(debug, tuple(np.round(dst).astype(int)), 3, (255, 0, 0), -1, lineType=cv2.LINE_AA)
+        else:
+            cv2.circle(debug, tuple(np.round(src).astype(int)), 3, (0, 0, 255), -1, lineType=cv2.LINE_AA)
+            cv2.circle(debug, tuple(np.round(dst).astype(int)), 3, (0, 255, 0), -1, lineType=cv2.LINE_AA)
+    return debug
+
+
+def draw_debug_mesh(img, src_points, dst_points, point_kinds, triangles):
+    debug = img.copy()
+    for indices in triangles:
+        pts = np.round(dst_points[list(indices)]).astype(np.int32)
+        cv2.polylines(debug, [pts], isClosed=True, color=(160, 160, 160), thickness=1, lineType=cv2.LINE_AA)
+    return draw_debug_points(debug, src_points, dst_points, point_kinds)
+
+
+def resize_face_local(input_path, output_path, scale_x, scale_y, anchor_scale, forehead_expand, debug_points=None, debug_mesh=None):
+    img = read_image(input_path)
+    h, w = img.shape[:2]
+
+    landmarks = detect_landmarks_bgr(img)
+    if landmarks is None:
+        raise RuntimeError("No face detected.")
+
+    src_points, dst_points, point_kinds, _, _, _ = build_control_points(
+        landmarks,
+        w,
+        h,
+        scale_x,
+        scale_y,
+        anchor_scale,
+        forehead_expand,
+    )
+    if len(dst_points) < 4:
+        raise RuntimeError("Not enough control points for mesh warp.")
+
+    triangles = delaunay_triangles(dst_points, w, h)
+    if not triangles:
+        raise RuntimeError("Delaunay triangulation produced no usable triangles.")
+
+    result = warp_mesh(img, src_points, dst_points, triangles)
+    write_image(output_path, result)
+
+    if debug_points:
+        write_image(debug_points, draw_debug_points(img, src_points, dst_points, point_kinds))
+    if debug_mesh:
+        write_image(debug_mesh, draw_debug_mesh(img, src_points, dst_points, point_kinds, triangles))
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Resize a detected face with a continuous face-local landmark mesh warp."
+    )
+    parser.add_argument("--input", required=True, help="Input image path.")
+    parser.add_argument("--output", required=True, help="Output image path.")
+    parser.add_argument("--scale", type=float, default=1.0, help="Uniform face-local scale.")
+    parser.add_argument("--scale-x", type=float, default=None, help="Face-local horizontal scale.")
+    parser.add_argument("--scale-y", type=float, default=None, help="Face-local vertical scale.")
+    parser.add_argument("--anchor-scale", type=float, default=1.6, help="Expansion factor for fixed outer anchors.")
+    parser.add_argument("--forehead-expand", type=float, default=0.0, help="Add moving forehead controls above the face oval as a fraction of face height.")
+    parser.add_argument("--debug-points", default=None, help="Optional image showing source, destination, and anchor points.")
+    parser.add_argument("--debug-mesh", default=None, help="Optional image showing destination Delaunay mesh.")
+    return parser.parse_args()
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--source", help="source face image")
-    ap.add_argument("--target", help="target/original image")
-    ap.add_argument("--output", help="output image path")
-    ap.add_argument("--input-folder", help="folder of images to process one by one")
-    ap.add_argument("--output-folder", help="folder to save batch results")
-    ap.add_argument("--mode", choices=("composite", "stretch"), default="composite", help="composite uses the regular feathered paste; stretch ignores feather and mask expansion for a pure geometry pass")
-    ap.add_argument("--scale", type=float, default=0.92, help="face scale adjust, e.g. 0.92 smaller, 1.08 larger")
-    ap.add_argument("--offset-x", type=int, default=0)
-    ap.add_argument("--offset-y", type=int, default=0)
-    ap.add_argument("--mask-expand", type=int, default=-2)
-    ap.add_argument("--mask-expand-left", type=int)
-    ap.add_argument("--mask-expand-right", type=int)
-    ap.add_argument("--mask-expand-top", type=int)
-    ap.add_argument("--mask-expand-bottom", type=int)
-    ap.add_argument("--feather", type=int, default=12)
-    ap.add_argument("--feather-left", type=int)
-    ap.add_argument("--feather-right", type=int)
-    ap.add_argument("--feather-top", type=int)
-    ap.add_argument("--feather-bottom", type=int)
-    ap.add_argument("--feather-curve", choices=("gaussian", "linear", "smoothstep", "power"), default="gaussian")
-    ap.add_argument("--feather-gamma", type=float, default=1.0)
-    ap.add_argument("--stretch", type=float, default=None, help="scale-aware boundary warp factor; 1.0 uses a source band as wide as the scale difference")
-    ap.add_argument("--stretch-left", type=float)
-    ap.add_argument("--stretch-right", type=float)
-    ap.add_argument("--stretch-top", type=float)
-    ap.add_argument("--stretch-bottom", type=float)
-    ap.add_argument("--stretch-feather", type=int, default=0, help="optional seam softening for the stretch or compact blend")
-    ap.add_argument("--stretch-gamma", type=float, default=1.0, help="adjust the stretched gap mask after feathering")
-    ap.add_argument("--stretch-mode", choices=("box", "radial"), default="box", help="stretch mapping mode")
-    ap.add_argument("--no-rotate", action="store_true")
-    ap.add_argument("--color-match", action="store_true")
-    ap.add_argument("--debug-mask", default=None, help="optional mask output path")
-    ap.add_argument("--debug-mask-folder", default=None, help="optional folder for batch debug masks")
-    ap.add_argument("--recursive", action="store_true", help="process images in nested folders")
-    args = ap.parse_args()
+    args = parse_args()
+    scale_x = args.scale if args.scale_x is None else args.scale_x
+    scale_y = args.scale if args.scale_y is None else args.scale_y
 
-    mode = validate_args(ap, args)
-    if mode == "batch":
-        run_batch(args)
-    else:
-        run_single(args)
+    if scale_x <= 0 or scale_y <= 0:
+        raise RuntimeError("Scale values must be greater than zero.")
+    if args.anchor_scale <= 1.0:
+        raise RuntimeError("--anchor-scale must be greater than 1.0.")
+    if args.forehead_expand < 0:
+        raise RuntimeError("--forehead-expand must be greater than or equal to 0.")
+
+    resize_face_local(
+        input_path=args.input,
+        output_path=args.output,
+        scale_x=scale_x,
+        scale_y=scale_y,
+        anchor_scale=args.anchor_scale,
+        forehead_expand=args.forehead_expand,
+        debug_points=args.debug_points,
+        debug_mesh=args.debug_mesh,
+    )
+    print("saved:", Path(args.output))
 
 
 if __name__ == "__main__":
