@@ -1,22 +1,27 @@
 # WA Face Scale CLI
 
-A tiny command-line tool for resizing and re-compositing a face onto an original image.
+A tiny command-line toolkit for resizing a face in an original image.
 
 This is meant to solve a narrow problem similar to DeepFaceLab's face-scale merge adjustment:
 
 > make the detected face slightly smaller or larger, then blend it back into the target image.
 
-It is **not** a ComfyUI custom node. It is a standalone Python script.
+It is **not** a ComfyUI custom node. It is a pair of standalone Python scripts.
+
+There are two approaches:
+
+* `face_resize.py`: the older paste/composite approach. It scales a detected face region, optionally stretches or compacts the surrounding boundary, then blends or pastes the result back.
+* `face_warp.py`: the newer mesh-warp approach. It builds a face-local landmark mesh, moves the face-oval control points, keeps outer anchors fixed, and applies one continuous piecewise-affine deformation.
 
 ## What it does
 
-The script uses:
+Both scripts use:
 
 * MediaPipe FaceMesh for facial landmarks
 * OpenCV for affine warping
 * NumPy for image blending
 
-Basic process:
+Basic `face_resize.py` process:
 
 1. Detect face landmarks in the source image.
 2. Detect face landmarks in the target image.
@@ -25,6 +30,16 @@ Basic process:
 5. Optionally stretch pixels from just outside the original target face boundary into the shrink gap.
 6. Warp the source face onto the target image.
 7. Blend the result and save a PNG/JPG output.
+
+Basic `face_warp.py` process:
+
+1. Detect face landmarks in the input image.
+2. Build a face-local coordinate system from the eye axis and forehead-to-chin direction.
+3. Scale the face-oval control points in face-local coordinates.
+4. Add fixed outer anchor points around an expanded face-local box.
+5. Delaunay-triangulate the destination control points.
+6. Apply a piecewise-affine warp inside the ROI.
+7. Save the warped image and optional point/mesh debug images.
 
 ## EXAMPLE
 
@@ -87,6 +102,12 @@ has mp.solutions: True
 ```
 
 ## Usage
+
+### Approach 1: paste/stretch compositing
+
+Use `face_resize.py` when you want the original source/target compositing controls:
+mask expansion, feathering, color matching, offsets, batch mode, and optional
+boundary stretch/compact behavior.
 
 Example:
 
@@ -203,7 +224,56 @@ Process nested folders too:
   --scale 1.08
 ```
 
-## Parameters
+### Approach 2: continuous mesh warp
+
+Use `face_warp.py` when you want a single-image, in-place deformation without a
+separate pasted face patch. This is the approach to test if the goal is avoiding
+visible patch seams through one continuous landmark mesh deformation.
+
+Basic mesh warp:
+
+```bash
+./.venv/bin/python face_warp.py \
+  --input original.jpg \
+  --output warped.jpg \
+  --scale 0.92
+```
+
+Use different face-local X/Y scales:
+
+```bash
+./.venv/bin/python face_warp.py \
+  --input original.jpg \
+  --output warped_xy.jpg \
+  --scale-x 0.94 \
+  --scale-y 0.90
+```
+
+Write debug point and mesh overlays:
+
+```bash
+./.venv/bin/python face_warp.py \
+  --input original.jpg \
+  --output warped_debug.jpg \
+  --scale 0.94 \
+  --anchor-scale 1.6 \
+  --debug-points debug_points.png \
+  --debug-mesh debug_mesh.png
+```
+
+Try a few shrink strengths:
+
+```bash
+./.venv/bin/python face_warp.py --input original.jpg --output warp_0.97.jpg --scale 0.97
+./.venv/bin/python face_warp.py --input original.jpg --output warp_0.94.jpg --scale 0.94
+./.venv/bin/python face_warp.py --input original.jpg --output warp_0.90.jpg --scale 0.90
+```
+
+`face_warp.py` v1 is intentionally single-image only. It does not support
+source/target swapping, batch mode, face paste feathering, inpainting, or hair
+segmentation.
+
+## `face_resize.py` parameters
 
 ```text
 --source        Source face image.
@@ -258,6 +328,24 @@ follow the perpendicular forehead-to-chin axis. If the head is tilted, these
 directions tilt with the face. The default `--stretch-mode box` uses this same
 face-local axis system, not the raw image horizontal and vertical axes.
 
+## `face_warp.py` parameters
+
+```text
+--input         Input image path.
+--output        Output image path.
+--scale         Uniform face-local scale. Example: 0.92 smaller, 1.08 larger.
+--scale-x       Face-local horizontal scale. Overrides --scale for the eye-to-eye axis.
+--scale-y       Face-local vertical scale. Overrides --scale for the forehead-to-chin axis.
+--anchor-scale  Expansion factor for the fixed outer anchor box. Default: 1.6.
+--debug-points  Save a debug image with original oval points in red, scaled oval points in green, and fixed outer anchors in blue.
+--debug-mesh    Save a debug image with destination Delaunay triangles in gray.
+```
+
+`face_warp.py` scales in face-local coordinates, not raw image coordinates.
+`--scale-x` follows the eye-to-eye axis. `--scale-y` follows the perpendicular
+axis corrected toward the chin. The outer anchor points stay fixed so the mesh
+deformation fades into the surrounding image.
+
 ## Practical notes
 
 Enlarging a face is usually easier because the larger pasted face covers the original face underneath.
@@ -270,6 +358,10 @@ In `--mode stretch`, `--mask-expand`, `--feather`, directional feather options, 
 
 Small to moderate shrinking usually works best. Large shrinking can make the stretched band look smeared or rubbery, so tune `--stretch` together with `--scale`.
 
+For `face_warp.py`, small to moderate shrinking is also the best first test.
+If `--scale 0.90` looks too distorted but `--scale 0.94` looks clean, the mesh
+warp is working and the remaining issue is deformation strength.
+
 ## What this is not
 
 This is not a face swap model.
@@ -278,7 +370,7 @@ This is not a face restoration model.
 
 This is not a ComfyUI custom node.
 
-This is a lightweight face-geometry compositing script.
+This is a lightweight face-geometry toolkit.
 
 ## Why install with `--no-deps`?
 
